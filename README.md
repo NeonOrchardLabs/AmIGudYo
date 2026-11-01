@@ -1,7 +1,7 @@
 # Am I Good? (Working Name)
 
 Portable Rust application for visible Windows security checks and approved repairs.
-Development build: `0.1.0-dev.3`.
+Development build: `0.1.0-dev.4`.
 
 ## Run
 
@@ -18,6 +18,26 @@ Open `amigood.exe` for the native interface, or use:
 The interface provides Overview/Advanced views, light/dark themes, a live work
 log, software inventory, and one combined review for selected repairs.
 Server installations default to low graphics. Server Core uses the CLI.
+
+## Opening A New Copy
+
+GUI launches coordinate within the same Windows user, session and integrity
+level. An idle participating copy exits cooperatively, then the executable you
+just launched opens. Active scans, approved repairs and metadata preparation
+finish before takeover; the old window shows a waiting notice. Window-close
+requests during work are deferred until that work finishes too.
+
+The new process waits up to two minutes before a busy owner acknowledges the
+handoff. A request can be cancelled before acknowledgment without closing the
+owner. After acknowledgment, the launcher waits for the owner to exit; it does
+not kill a stuck process. Startup logging is initialized before requesting a
+handoff, so a storage failure leaves the existing copy available.
+
+Coordination uses private Windows kernel objects, without TCP, files, helper
+processes or executable paths sent over IPC. Headless CLI commands run
+independently. Separate elevated/non-elevated sessions are kept separate.
+Builds older than `0.1.0-dev.4` do not support this protocol and must be closed
+manually once. The app cannot safely infer whether those older builds are busy.
 
 ## Current Scope
 

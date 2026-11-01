@@ -47,6 +47,9 @@ fn main() -> Result<()> {
         },
         logging: !options.no_log,
     };
+    let os = platform::detect_os();
+    let server_core_fallback = os.is_server && !os.has_desktop;
+    let headless = options.scan || options.fix.is_some() || server_core_fallback;
     let audit_path = if options.no_log || options.noexternal {
         None
     } else {
@@ -54,6 +57,21 @@ fn main() -> Result<()> {
     };
     let mut audit = Audit::new(policy.logging, audit_path)
         .context("Initialize audit logging; retry with --no-log to disable logging")?;
+    // Verify the new copy can initialize its audit first. A failed portable
+    // storage setup must not ask a healthy existing window to close.
+    #[cfg(feature = "gui")]
+    let instance = if !headless && !options.airgapready {
+        audit.log("LAUNCH", "Requesting cooperative GUI handoff");
+        let launch = amigood::instance::coordinate().inspect_err(|error| {
+            audit.log("ERROR", format!("GUI handoff failed: {error:#}"));
+        })?;
+        match launch {
+            amigood::instance::Launch::Owner(instance) => Some(instance),
+            amigood::instance::Launch::Forwarded => return Ok(()),
+        }
+    } else {
+        None
+    };
 
     if options.airgapready {
         let message = bundle::prepare(&policy, &mut audit)?;
@@ -61,14 +79,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let os = platform::detect_os();
-    let server_core_fallback = os.is_server && !os.has_desktop;
-    let headless = options.scan || options.fix.is_some() || server_core_fallback;
-
     if !headless {
         #[cfg(feature = "gui")]
         {
-            return amigood::gui::run(policy, audit, options.lowgraphics);
+            return amigood::gui::run(
+                policy,
+                audit,
+                options.lowgraphics,
+                instance.context("GUI instance coordination unavailable")?,
+            );
         }
         #[cfg(not(feature = "gui"))]
         {

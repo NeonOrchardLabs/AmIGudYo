@@ -2,6 +2,7 @@
 use crate::{
     audit::Audit,
     engine::{self, Report},
+    instance::{Control, Instance, WorkGuard},
     jewel::jewel,
     model::{Finding, Repair, Status},
     policy::Policy,
@@ -10,7 +11,7 @@ use anyhow::Result;
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 use std::{sync::mpsc, time::Duration};
 
-pub fn run(policy: Policy, audit: Audit, low: bool) -> Result<()> {
+pub fn run(policy: Policy, audit: Audit, low: bool, instance: Instance) -> Result<()> {
     let server = crate::platform::detect_os().is_server;
     let size = initial_window_size();
     let options = eframe::NativeOptions {
@@ -31,6 +32,7 @@ pub fn run(policy: Policy, audit: Audit, low: bool) -> Result<()> {
                 audit,
                 low || server,
                 &cc.egui_ctx,
+                instance,
             )))
         }),
     )
@@ -95,6 +97,9 @@ enum Message {
     Failed(String),
 }
 struct Workbench {
+    instance: Instance,
+    restart_waiting: bool,
+    close_after_work: bool,
     policy: Policy,
     audit: Audit,
     report: Option<Report>,
@@ -117,9 +122,18 @@ struct Workbench {
     message_error: bool,
 }
 impl Workbench {
-    fn new(policy: Policy, audit: Audit, low: bool, ctx: &egui::Context) -> Self {
+    fn new(
+        policy: Policy,
+        audit: Audit,
+        low: bool,
+        ctx: &egui::Context,
+        instance: Instance,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut this = Self {
+            instance,
+            restart_waiting: false,
+            close_after_work: false,
             policy,
             audit,
             report: None,
@@ -144,10 +158,26 @@ impl Workbench {
         this.scan(ctx);
         this
     }
+    fn begin_work(&mut self) -> Option<WorkGuard> {
+        if self.close_after_work {
+            return None;
+        }
+        match self.instance.begin_work() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                self.message = format!("A new copy is taking over: {error}");
+                self.message_error = false;
+                None
+            }
+        }
+    }
     fn scan(&mut self, ctx: &egui::Context) {
         if self.busy {
             return;
         }
+        let Some(work) = self.begin_work() else {
+            return;
+        };
         self.busy = true;
         self.message = "Checking this computer…".into();
         self.message_error = false;
@@ -156,6 +186,7 @@ impl Workbench {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let _work = work;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 engine::scan_with_policy(&policy, &mut audit)
             }));
@@ -179,6 +210,9 @@ impl Workbench {
         if self.busy || !self.consent || self.reviewed.is_empty() {
             return;
         }
+        let Some(work) = self.begin_work() else {
+            return;
+        };
         self.busy = true;
         self.review = false;
         self.consent = false;
@@ -190,6 +224,7 @@ impl Workbench {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let _work = work;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let results = engine::repair_batch(&repairs, &mut audit);
                 let report = engine::scan_with_policy(&policy, &mut audit);
@@ -207,6 +242,9 @@ impl Workbench {
         if self.busy || !self.policy.network_allowed() {
             return;
         }
+        let Some(work) = self.begin_work() else {
+            return;
+        };
         self.busy = true;
         self.message = "Downloading advisory metadata…".into();
         self.message_error = false;
@@ -215,6 +253,7 @@ impl Workbench {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let _work = work;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let result =
                     crate::bundle::prepare(&policy, &mut audit).map_err(|e| format!("{e:#}"));
@@ -364,11 +403,20 @@ impl Workbench {
                 }
             }
             if response.clicked() {
-                ui.ctx().send_viewport_cmd(match index {
-                    0 => egui::ViewportCommand::Minimized(true),
-                    1 => egui::ViewportCommand::Maximized(!maximized),
-                    _ => egui::ViewportCommand::Close,
-                });
+                match index {
+                    0 => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    1 => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
+                    _ => {
+                        self.close_after_work = true;
+                        if !self.busy {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
             }
         }
     }
@@ -715,9 +763,53 @@ impl Workbench {
     }
 }
 impl eframe::App for Workbench {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.busy {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            self.close_after_work = true;
+        }
+        if self.close_after_work && !self.busy {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        match self.instance.poll() {
+            Control::Close => {
+                self.audit.log(
+                    "RESTART",
+                    "Idle copy handing over to the newly launched executable",
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            Control::Waiting => {
+                if !self.restart_waiting {
+                    self.audit.log(
+                        "RESTART",
+                        "Handoff waiting for the current operation to finish",
+                    );
+                }
+                self.restart_waiting = true;
+            }
+            Control::None => {
+                if self.restart_waiting {
+                    self.audit.log(
+                        "RESTART",
+                        "Pending handoff cleared; this copy continues running",
+                    );
+                    self.message = "Pending restart cancelled. Current work continues.".into();
+                }
+                self.restart_waiting = false;
+            }
+        }
+        // Poll local kernel objects even when the UI is idle; no network or
+        // app-owned storage is needed to discover another launch.
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         resize_edges(ui);
-        self.receive();
         let ctx = ui.ctx().clone();
         ctx.set_visuals(if self.dark {
             egui::Visuals::dark()
@@ -752,6 +844,15 @@ impl eframe::App for Workbench {
         );
         egui::Panel::top("custom_titlebar").show(ui, |ui| self.titlebar(ui));
         egui::Panel::top("header").show(ui, |ui| self.header(ui));
+        if self.restart_waiting || self.close_after_work {
+            egui::Panel::top("restart_waiting").show(ui, |ui| {
+                ui.label(if self.restart_waiting {
+                    "New copy waiting. Finishing the current operation first."
+                } else {
+                    "This copy will close when the current operation finishes."
+                });
+            });
+        }
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.weak(env!("CARGO_PKG_VERSION"));

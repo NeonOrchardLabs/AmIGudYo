@@ -4,6 +4,7 @@ pub mod cli;
 pub mod engine;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod instance;
 #[cfg(feature = "gui")]
 pub mod jewel;
 pub mod model;
