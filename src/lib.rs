@@ -4,6 +4,8 @@ pub mod cli;
 pub mod engine;
 #[cfg(feature = "gui")]
 pub mod gui;
+#[cfg(feature = "gui")]
+pub mod jewel;
 pub mod model;
 pub mod platform;
 pub mod policy;

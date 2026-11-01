@@ -1,7 +1,7 @@
 # Am I Good? (Working Name)
 
 Portable Rust application for visible Windows security checks and approved repairs.
-Development build: `0.1.0-dev.1`.
+Development build: `0.1.0-dev.3`.
 
 ## Run
 

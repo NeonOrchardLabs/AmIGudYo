@@ -2,11 +2,12 @@
 use crate::{
     audit::Audit,
     engine::{self, Report},
+    jewel::jewel,
     model::{Finding, Repair, Status},
     policy::Policy,
 };
 use anyhow::Result;
-use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat, Vec2};
+use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 use std::{sync::mpsc, time::Duration};
 
 pub fn run(policy: Policy, audit: Audit, low: bool) -> Result<()> {
@@ -14,6 +15,7 @@ pub fn run(policy: Policy, audit: Audit, low: bool) -> Result<()> {
     let size = initial_window_size();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_decorations(false)
             .with_inner_size(size)
             .with_min_inner_size([480.0_f32.min(size[0]), 320.0_f32.min(size[1])])
             .with_clamp_size_to_monitor_size(true),
@@ -104,7 +106,7 @@ struct Workbench {
     advanced: bool,
     section: Section,
     selected: Vec<Repair>,
-    expanded: Option<String>,
+    expanded: std::collections::HashMap<String, bool>,
     review: bool,
     consent: bool,
     reviewed: Vec<Repair>,
@@ -129,7 +131,7 @@ impl Workbench {
             advanced: false,
             section: Section::All,
             selected: Vec::new(),
-            expanded: None,
+            expanded: Default::default(),
             review: false,
             consent: false,
             reviewed: Vec::new(),
@@ -274,12 +276,104 @@ impl Workbench {
             }
         }
     }
+    fn titlebar(&mut self, ui: &mut egui::Ui) {
+        let (bar, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::hover());
+        let controls = 120.0;
+        let title =
+            egui::Rect::from_min_max(bar.min, egui::pos2(bar.right() - controls, bar.bottom()));
+        let drag = ui.interact(
+            title,
+            ui.id().with("window_drag"),
+            egui::Sense::click_and_drag(),
+        );
+        let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        if drag.double_clicked() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        } else if drag.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(title.shrink2(egui::vec2(9.0, 2.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                jewel(ui, Color32::from_rgb(75, 139, 229), 15.0, self.low);
+                ui.label(RichText::new("Am I Good?").strong().size(14.0));
+            },
+        );
+        for (index, label) in [
+            "Minimize",
+            if maximized { "Restore" } else { "Maximize" },
+            "Close",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(bar.right() - controls + index as f32 * 40.0, bar.top()),
+                egui::vec2(40.0, 34.0),
+            );
+            let response = ui
+                .interact(rect, ui.id().with(("caption", index)), egui::Sense::click())
+                .on_hover_text(label);
+            let mut ink = ui.visuals().text_color();
+            if response.hovered() {
+                let fill = if index == 2 {
+                    ink = Color32::WHITE;
+                    danger(self.dark)
+                } else {
+                    ui.visuals().widgets.hovered.bg_fill
+                };
+                ui.painter()
+                    .rect_filled(rect.shrink2(egui::vec2(2.0, 3.0)), 3.0, fill);
+            }
+            let c = rect.center();
+            let stroke = Stroke::new(1.2, ink);
+            match index {
+                0 => {
+                    ui.painter().line_segment(
+                        [c + egui::vec2(-5.0, 1.0), c + egui::vec2(5.0, 1.0)],
+                        stroke,
+                    );
+                }
+                1 => {
+                    let icon = egui::Rect::from_center_size(c, egui::vec2(10.0, 9.0));
+                    if maximized {
+                        ui.painter().rect_stroke(
+                            icon.translate(egui::vec2(2.0, -2.0)),
+                            0.0,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    ui.painter().rect_filled(icon, 0.0, ui.visuals().panel_fill);
+                    ui.painter()
+                        .rect_stroke(icon, 0.0, stroke, egui::StrokeKind::Inside);
+                }
+                _ => {
+                    ui.painter().line_segment(
+                        [c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)],
+                        stroke,
+                    );
+                    ui.painter().line_segment(
+                        [c + egui::vec2(-5.0, 5.0), c + egui::vec2(5.0, -5.0)],
+                        stroke,
+                    );
+                }
+            }
+            if response.clicked() {
+                ui.ctx().send_viewport_cmd(match index {
+                    0 => egui::ViewportCommand::Minimized(true),
+                    1 => egui::ViewportCommand::Maximized(!maximized),
+                    _ => egui::ViewportCommand::Close,
+                });
+            }
+        }
+    }
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            jewel(ui, Color32::from_rgb(75, 139, 229), 17.0, self.low);
-            ui.label(RichText::new("Am I Good?").strong().size(18.0));
-            ui.weak(RichText::new("NEON ORCHARD").size(10.0));
-            ui.separator();
             ui.selectable_value(&mut self.advanced, false, "Overview");
             ui.selectable_value(&mut self.advanced, true, "Advanced");
             ui.separator();
@@ -334,9 +428,9 @@ impl Workbench {
                             let selected = self.section == section;
                             let fill = if selected {
                                 if self.dark {
-                                    blend(Color32::from_rgb(28, 32, 39), tint, 0.14)
+                                    Color32::from_rgb(43, 48, 56)
                                 } else {
-                                    blend(Color32::from_rgb(247, 248, 250), tint, 0.12)
+                                    Color32::from_rgb(231, 234, 238)
                                 }
                             } else {
                                 Color32::TRANSPARENT
@@ -357,16 +451,6 @@ impl Workbench {
                                         }
                                     });
                                 });
-                            if selected {
-                                let rect = row.response.rect;
-                                ui.painter().line_segment(
-                                    [
-                                        rect.left_top() + egui::vec2(5.0, 6.0),
-                                        rect.left_bottom() + egui::vec2(5.0, -6.0),
-                                    ],
-                                    Stroke::new(2.0, tint),
-                                );
-                            }
                             if row.response.interact(egui::Sense::click()).clicked() {
                                 self.section = section;
                             }
@@ -525,81 +609,16 @@ impl Workbench {
         });
         ui.add_space(9.0);
         for finding in report.findings.iter().filter(|f| self.section.accepts(f)) {
-            let color = status_color(finding.status, self.dark);
-            let surface = if self.dark {
-                Color32::from_rgb(36, 42, 50)
-            } else {
-                Color32::from_rgb(247, 248, 250)
-            };
-            let row = egui::Frame::new()
-                .fill(surface)
-                .corner_radius(if self.low { 2 } else { 7 })
-                .inner_margin(10)
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        jewel(ui, color, 16.0, self.low);
-                        if let Some(repair) = finding
-                            .repair
-                            .filter(|_| finding.status == Status::NeedsAttention)
-                        {
-                            let mut selected = self.selected.contains(&repair);
-                            if ui
-                                .add_enabled(
-                                    !self.busy,
-                                    egui::Checkbox::without_text(&mut selected),
-                                )
-                                .changed()
-                            {
-                                if selected {
-                                    self.selected.push(repair);
-                                } else {
-                                    self.selected.retain(|r| *r != repair);
-                                }
-                            }
-                        }
-                        ui.label(RichText::new(&finding.name).strong());
-                        ui.label(
-                            RichText::new(status_label(finding.status))
-                                .color(color)
-                                .small(),
-                        );
-                        if ui
-                            .small_button(
-                                if self.expanded.as_deref() == Some(finding.id.as_str()) {
-                                    "Less"
-                                } else {
-                                    "Details"
-                                },
-                            )
-                            .clicked()
-                        {
-                            self.expanded = if self.expanded.as_deref() == Some(finding.id.as_str())
-                            {
-                                None
-                            } else {
-                                Some(finding.id.clone())
-                            };
-                        }
-                    });
-                    if self.advanced || self.expanded.as_deref() == Some(finding.id.as_str()) {
-                        ui.add_space(6.0);
-                        ui.label(&finding.evidence);
-                        ui.weak(format!("Source: {}", finding.source));
-                        if self.advanced {
-                            ui.monospace(&finding.id);
-                        }
-                    }
-                });
-            let rect = row.response.rect;
-            ui.painter().line_segment(
-                [
-                    rect.left_top() + egui::vec2(5.0, 8.0),
-                    rect.left_bottom() + egui::vec2(5.0, -8.0),
-                ],
-                Stroke::new(2.0, color.gamma_multiply(0.7)),
+            finding_row(
+                ui,
+                finding,
+                &mut self.expanded,
+                &mut self.selected,
+                self.advanced,
+                self.busy,
+                self.low,
+                self.dark,
             );
-            ui.add_space(6.0);
         }
         if self.section == Section::Apps {
             ui.add_space(8.0);
@@ -697,6 +716,7 @@ impl Workbench {
 }
 impl eframe::App for Workbench {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        resize_edges(ui);
         self.receive();
         let ctx = ui.ctx().clone();
         ctx.set_visuals(if self.dark {
@@ -730,17 +750,18 @@ impl eframe::App for Workbench {
                 }
             },
         );
+        egui::Panel::top("custom_titlebar").show(ui, |ui| self.titlebar(ui));
         egui::Panel::top("header").show(ui, |ui| self.header(ui));
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.weak("0.1.0-dev.1");
+                ui.weak(env!("CARGO_PKG_VERSION"));
                 ui.weak("Local checks · No CVE coverage yet");
             });
         });
         self.work_log(ui);
         self.sidebar(ui);
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::both()
+            egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| self.content(ui));
         });
@@ -749,6 +770,41 @@ impl eframe::App for Workbench {
         if self.busy {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
+}
+
+fn resize_edges(ui: &mut egui::Ui) {
+    if ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+    let r = ui.ctx().content_rect();
+    let point = ui.ctx().input(|i| i.pointer.hover_pos());
+    let Some(p) = point else {
+        return;
+    };
+    let left = p.x < r.left() + 5.0;
+    let right = p.x > r.right() - 5.0;
+    let top = p.y < r.top() + 5.0;
+    let bottom = p.y > r.bottom() - 5.0;
+    use egui::{CursorIcon as C, ResizeDirection as D};
+    let (direction, cursor) = match (left, right, top, bottom) {
+        (true, _, true, _) => (D::NorthWest, C::ResizeNwSe),
+        (_, true, true, _) => (D::NorthEast, C::ResizeNeSw),
+        (true, _, _, true) => (D::SouthWest, C::ResizeNeSw),
+        (_, true, _, true) => (D::SouthEast, C::ResizeNwSe),
+        (true, _, _, _) => (D::West, C::ResizeHorizontal),
+        (_, true, _, _) => (D::East, C::ResizeHorizontal),
+        (_, _, true, _) => (D::North, C::ResizeVertical),
+        (_, _, _, true) => (D::South, C::ResizeVertical),
+        _ => return,
+    };
+    ui.ctx().set_cursor_icon(cursor);
+    if ui
+        .ctx()
+        .input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+    {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
     }
 }
 
@@ -772,6 +828,210 @@ fn category(f: &Finding) -> Section {
         Section::Other
     }
 }
+
+#[derive(Clone, Copy)]
+struct FindingRowLayout {
+    header: egui::Rect,
+    checkbox: Option<egui::Rect>,
+    name: egui::Rect,
+    status: egui::Rect,
+}
+
+fn short_name(finding: &Finding) -> &str {
+    match finding.id.as_str() {
+        "firewall-domain" => "Domain firewall",
+        "firewall-private" => "Private firewall",
+        "firewall-public" => "Public firewall",
+        "windows-firewall" => "Windows Firewall",
+        "advisory-coverage" => "Vulnerability coverage",
+        "inventory" => "Registered apps",
+        _ => &finding.name,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finding_row(
+    ui: &mut egui::Ui,
+    finding: &Finding,
+    expanded: &mut std::collections::HashMap<String, bool>,
+    selected: &mut Vec<Repair>,
+    advanced: bool,
+    busy: bool,
+    low: bool,
+    dark: bool,
+) -> FindingRowLayout {
+    let width = ui.available_width();
+    let repair = finding
+        .repair
+        .filter(|_| finding.status == Status::NeedsAttention);
+    let font = FontId::proportional(13.0);
+    let ink = if dark {
+        Color32::from_rgb(226, 231, 237)
+    } else {
+        Color32::from_rgb(35, 44, 56)
+    };
+    let status_galley = ui.painter().layout_no_wrap(
+        status_label(finding.status).into(),
+        FontId::proportional(11.0),
+        ink,
+    );
+    let status_width = status_galley.size().x;
+    let leading = 12.0 + 24.0 + if repair.is_some() { 28.0 } else { 0.0 };
+    let trailing = 12.0 + 16.0 + 12.0 + status_width;
+    let compact = width - leading - trailing - 14.0 < 80.0;
+    let name_width = (width - leading - if compact { 40.0 } else { trailing + 14.0 }).max(20.0);
+    let name_galley = ui
+        .painter()
+        .layout(short_name(finding).into(), font, ink, name_width);
+    let content_height = name_galley.size().y
+        + if compact {
+            status_galley.size().y + 5.0
+        } else {
+            0.0
+        };
+    let height = (content_height.max(24.0) + 24.0).max(48.0);
+    let (header_rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let header = ui.interact(
+        header_rect,
+        ui.id().with(("finding_header", &finding.id)),
+        egui::Sense::click(),
+    );
+    header.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, true, &finding.name)
+    });
+    if header.hovered() || header.has_focus() {
+        let fill = if dark {
+            Color32::from_rgb(37, 42, 49)
+        } else {
+            Color32::from_rgb(244, 246, 248)
+        };
+        ui.painter().rect_filled(header_rect, 0.0, fill);
+    }
+    if header.has_focus() {
+        ui.painter().rect_stroke(
+            header_rect.shrink(1.0),
+            0.0,
+            Stroke::new(1.0, ui.visuals().widgets.active.fg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let center = header_rect.center().y;
+    let jewel_rect = egui::Rect::from_center_size(
+        egui::pos2(header_rect.left() + 22.0, center),
+        egui::vec2(24.0, 24.0),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(jewel_rect), |ui| {
+        jewel(ui, status_color(finding.status, dark), 16.0, low);
+    });
+    let checkbox = repair.map(|_| {
+        egui::Rect::from_center_size(
+            egui::pos2(header_rect.left() + 48.0, center),
+            egui::vec2(22.0, 24.0),
+        )
+    });
+    let mut checkbox_activated = false;
+    if let (Some(action), Some(rect)) = (repair, checkbox) {
+        let mut checked = selected.contains(&action);
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.add_enabled(!busy, egui::Checkbox::without_text(&mut checked))
+            })
+            .inner;
+        checkbox_activated = response.clicked();
+        if response.changed() {
+            if checked {
+                selected.push(action);
+            } else {
+                selected.retain(|r| *r != action);
+            }
+        }
+    }
+    let status_right = header_rect.right() - 12.0 - 16.0 - 12.0;
+    let layout = FindingRowLayout {
+        header: header_rect,
+        checkbox,
+        name: egui::Rect::from_min_size(
+            egui::pos2(
+                header_rect.left() + leading,
+                if compact {
+                    header_rect.top() + 12.0
+                } else {
+                    center - name_galley.size().y * 0.5
+                },
+            ),
+            name_galley.size(),
+        ),
+        status: egui::Rect::from_min_size(
+            egui::pos2(
+                if compact {
+                    header_rect.left() + leading
+                } else {
+                    status_right - status_width
+                },
+                if compact {
+                    header_rect.top() + 12.0 + name_galley.size().y + 5.0
+                } else {
+                    center - status_galley.size().y * 0.5
+                },
+            ),
+            status_galley.size(),
+        ),
+    };
+    ui.painter().galley(layout.name.min, name_galley, ink);
+    ui.painter().galley(layout.status.min, status_galley, ink);
+    let open = expanded.get(&finding.id).copied().unwrap_or(advanced);
+    let c = egui::pos2(header_rect.right() - 19.0, center);
+    let points = if open {
+        [
+            c + egui::vec2(-3.0, -1.5),
+            c + egui::vec2(0.0, 1.5),
+            c + egui::vec2(3.0, -1.5),
+        ]
+    } else {
+        [
+            c + egui::vec2(-1.5, -3.0),
+            c + egui::vec2(1.5, 0.0),
+            c + egui::vec2(-1.5, 3.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::line(
+        points.to_vec(),
+        Stroke::new(1.2, muted(dark)),
+    ));
+    let over_checkbox = layout.checkbox.is_some_and(|r| {
+        ui.input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| r.contains(p))
+    });
+    let keyboard = header.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+    if keyboard || (header.clicked() && !checkbox_activated && !over_checkbox) {
+        expanded.insert(finding.id.clone(), !open);
+    }
+    if expanded.get(&finding.id).copied().unwrap_or(advanced) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 36,
+                right: 12,
+                top: 3,
+                bottom: 12,
+            })
+            .show(ui, |ui| {
+                ui.label(RichText::new(&finding.name).strong());
+                ui.label(&finding.evidence);
+                ui.weak(format!("Source: {}", finding.source));
+                if advanced {
+                    ui.monospace(&finding.id);
+                }
+            });
+    }
+    ui.separator();
+    // This also documents the reserved gap between wrapped names and status text.
+    debug_assert!(compact || layout.name.right() + 4.0 <= layout.status.left());
+    debug_assert!(layout.header.contains_rect(layout.name));
+    debug_assert!(layout.header.contains_rect(layout.status));
+    layout
+}
+
 fn status_label(status: Status) -> &'static str {
     match status {
         Status::Passed => "Passed",
@@ -821,57 +1081,6 @@ fn status_color(status: Status, dark: bool) -> Color32 {
         }
         Status::Unsupported => muted(dark),
     }
-}
-fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
-    let mix = |x: u8, y: u8| (f32::from(x) * (1.0 - amount) + f32::from(y) * amount).round() as u8;
-    Color32::from_rgba_unmultiplied(
-        mix(a.r(), b.r()),
-        mix(a.g(), b.g()),
-        mix(a.b(), b.b()),
-        mix(a.a(), b.a()),
-    )
-}
-/// A tiny rounded candy jewel: layered radial shading and curved reflections, no raster asset.
-fn jewel(ui: &mut egui::Ui, tint: Color32, diameter: f32, low: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(diameter + 4.0), egui::Sense::hover());
-    let center = rect.center();
-    let radius = diameter * 0.5;
-    let painter = ui.painter();
-    if low {
-        painter.circle_filled(center, radius, tint);
-        return;
-    }
-    painter.circle_filled(
-        center + egui::vec2(0.0, 1.3),
-        radius + 0.8,
-        Color32::from_black_alpha(36),
-    );
-    let base = blend(tint, Color32::BLACK, 0.38);
-    painter.circle_filled(center, radius, base);
-    for step in 0..18 {
-        let f = step as f32 / 18.0;
-        let color = blend(base, blend(tint, Color32::WHITE, 0.2), f);
-        painter.circle_filled(
-            center + egui::vec2(-f * radius * 0.13, -f * radius * 0.22),
-            radius * (1.0 - f * 0.55),
-            color,
-        );
-    }
-    painter.add(egui::Shape::ellipse_filled(
-        center + egui::vec2(-radius * 0.13, -radius * 0.43),
-        egui::vec2(radius * 0.5, radius * 0.23),
-        Color32::from_white_alpha(160),
-    ));
-    painter.add(egui::Shape::ellipse_filled(
-        center + egui::vec2(radius * 0.18, radius * 0.56),
-        egui::vec2(radius * 0.4, radius * 0.1),
-        Color32::from_white_alpha(54),
-    ));
-    painter.circle_stroke(
-        center,
-        radius,
-        Stroke::new(0.7, blend(tint, Color32::WHITE, 0.3)),
-    );
 }
 fn append(job: &mut egui::text::LayoutJob, text: &str, color: Color32) {
     job.append(
@@ -957,5 +1166,200 @@ fn highlight(job: &mut egui::text::LayoutJob, text: &str, dark: bool) {
             plain
         };
         append(job, piece, color);
+    }
+}
+
+#[cfg(test)]
+mod finding_row_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn finding() -> Finding {
+        Finding {
+            id: "firewall-private".into(),
+            name: "Private firewall local policy".into(),
+            status: Status::NeedsAttention,
+            evidence: "Local profile disabled; no external reachability verdict.".into(),
+            source: "Windows Firewall policy".into(),
+            repair: Some(Repair::EnablePrivateFirewall),
+        }
+    }
+    fn frame(
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+        expanded: &mut HashMap<String, bool>,
+        selected: &mut Vec<Repair>,
+        advanced: bool,
+        busy: bool,
+    ) -> FindingRowLayout {
+        let mut layout = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 700.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                layout = Some(finding_row(
+                    ui,
+                    &finding(),
+                    expanded,
+                    selected,
+                    advanced,
+                    busy,
+                    true,
+                    false,
+                ));
+            });
+        });
+        // This headless harness does not upload the font atlas to a renderer.
+        output.textures_delta.clear();
+        layout.unwrap()
+    }
+    fn click(
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        expanded: &mut HashMap<String, bool>,
+        selected: &mut Vec<Repair>,
+        advanced: bool,
+        busy: bool,
+    ) {
+        for pressed in [true, false] {
+            frame(
+                ctx,
+                320.0,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+                expanded,
+                selected,
+                advanced,
+                busy,
+            );
+        }
+    }
+    #[test]
+    fn checkbox_selection_and_disclosure_are_independent() {
+        let ctx = egui::Context::default();
+        let mut expanded = HashMap::new();
+        let mut selected = Vec::new();
+        let layout = frame(
+            &ctx,
+            320.0,
+            vec![],
+            &mut expanded,
+            &mut selected,
+            false,
+            false,
+        );
+        click(
+            &ctx,
+            layout.checkbox.unwrap().center(),
+            &mut expanded,
+            &mut selected,
+            false,
+            false,
+        );
+        assert_eq!(selected, vec![Repair::EnablePrivateFirewall]);
+        assert!(!expanded.get("firewall-private").copied().unwrap_or(false));
+        click(
+            &ctx,
+            layout.name.center(),
+            &mut expanded,
+            &mut selected,
+            false,
+            false,
+        );
+        assert_eq!(expanded.get("firewall-private"), Some(&true));
+        assert_eq!(selected, vec![Repair::EnablePrivateFirewall]);
+    }
+    #[test]
+    fn busy_checkbox_does_not_select_or_disclose() {
+        let ctx = egui::Context::default();
+        let mut expanded = HashMap::new();
+        let mut selected = Vec::new();
+        let layout = frame(
+            &ctx,
+            320.0,
+            vec![],
+            &mut expanded,
+            &mut selected,
+            false,
+            true,
+        );
+        click(
+            &ctx,
+            layout.checkbox.unwrap().center(),
+            &mut expanded,
+            &mut selected,
+            false,
+            true,
+        );
+        assert!(selected.is_empty());
+        assert!(expanded.is_empty());
+    }
+    #[test]
+    fn advanced_disclosure_can_close_and_reopen() {
+        let ctx = egui::Context::default();
+        let mut expanded = HashMap::new();
+        let mut selected = Vec::new();
+        let layout = frame(
+            &ctx,
+            320.0,
+            vec![],
+            &mut expanded,
+            &mut selected,
+            true,
+            false,
+        );
+        click(
+            &ctx,
+            layout.name.center(),
+            &mut expanded,
+            &mut selected,
+            true,
+            false,
+        );
+        assert_eq!(expanded.get("firewall-private"), Some(&false));
+        click(
+            &ctx,
+            layout.name.center(),
+            &mut expanded,
+            &mut selected,
+            true,
+            false,
+        );
+        assert_eq!(expanded.get("firewall-private"), Some(&true));
+    }
+    #[test]
+    fn wrapped_names_and_status_keep_their_own_space() {
+        for width in [240.0, 300.0, 700.0] {
+            let ctx = egui::Context::default();
+            let mut expanded = HashMap::new();
+            let mut selected = Vec::new();
+            let layout = frame(
+                &ctx,
+                width,
+                vec![],
+                &mut expanded,
+                &mut selected,
+                false,
+                false,
+            );
+            assert!(layout.header.contains_rect(layout.name));
+            assert!(layout.header.contains_rect(layout.status));
+            assert!(!layout.name.intersects(layout.status));
+            assert!(!layout.checkbox.unwrap().intersects(layout.name));
+        }
     }
 }
