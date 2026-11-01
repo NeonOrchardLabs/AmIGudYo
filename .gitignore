@@ -1,0 +1,11 @@
+/target/
+/dist/
+/Data/
+/airgap/
+/AGENTS.md
+/CLAUDE.md
+*.log
+*.tmp
+/.serena/
+/assets/ui/status-gem*
+
