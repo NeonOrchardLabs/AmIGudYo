@@ -1,7 +1,7 @@
 //! Native presentation. All system work runs outside the rendering thread.
 use crate::{
     audit::Audit,
-    engine::{self, Report},
+    engine::{self, RepairPlan, Report},
     instance::{Control, Instance, WorkGuard},
     jewel::jewel,
     model::{Finding, Repair, Status},
@@ -75,6 +75,7 @@ enum Section {
     Apps,
     Network,
     Other,
+    Catalog,
 }
 impl Section {
     fn label(self) -> &'static str {
@@ -84,6 +85,7 @@ impl Section {
             Self::Apps => "Apps",
             Self::Network => "Network",
             Self::Other => "Other",
+            Self::Catalog => "Repairs",
         }
     }
     fn accepts(self, f: &Finding) -> bool {
@@ -114,7 +116,7 @@ struct Workbench {
     expanded: std::collections::HashMap<String, bool>,
     review: bool,
     consent: bool,
-    reviewed: Vec<Repair>,
+    reviewed: Option<RepairPlan>,
     settings: bool,
     log_open: bool,
     log_follow: bool,
@@ -148,7 +150,7 @@ impl Workbench {
             expanded: Default::default(),
             review: false,
             consent: false,
-            reviewed: Vec::new(),
+            reviewed: None,
             settings: false,
             log_open: true,
             log_follow: true,
@@ -207,9 +209,18 @@ impl Workbench {
         });
     }
     fn apply(&mut self, ctx: &egui::Context) {
-        if self.busy || !self.consent || self.reviewed.is_empty() {
+        if self.busy || !self.consent || self.reviewed.is_none() {
             return;
         }
+        let plan = self.reviewed.as_ref().unwrap().clone();
+        let approval = match approve_review(&plan, self.consent) {
+            Ok(approval) => approval,
+            Err(error) => {
+                self.message = format!("Plan approval failed: {error:#}");
+                self.message_error = true;
+                return;
+            }
+        };
         let Some(work) = self.begin_work() else {
             return;
         };
@@ -218,7 +229,7 @@ impl Workbench {
         self.consent = false;
         self.message = "Applying selected repairs and checking again…".into();
         self.message_error = false;
-        let repairs = self.reviewed.clone();
+        self.reviewed = None;
         let mut audit = self.audit.clone();
         let policy = self.policy.clone();
         let tx = self.tx.clone();
@@ -226,7 +237,7 @@ impl Workbench {
         std::thread::spawn(move || {
             let _work = work;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let results = engine::repair_batch(&repairs, &mut audit);
+                let results = engine::execute_plan(&plan, &approval, &mut audit);
                 let report = engine::scan_with_policy(&policy, &mut audit);
                 Message::Repaired(report, results)
             }));
@@ -293,10 +304,18 @@ impl Workbench {
                 }
                 Message::Repaired(report, results) => {
                     let failures = results.iter().filter(|(_, r)| r.is_err()).count();
+                    let restart = results
+                        .iter()
+                        .any(|(repair, result)| result.is_ok() && repair.restart_required());
                     self.report = Some(report);
                     self.message_error = failures != 0;
                     self.message = if failures == 0 {
-                        "Repair steps complete. Fresh check results are shown below.".into()
+                        if restart {
+                            "Configuration rechecked. A restart is required; runtime effects remain unverified until then.".into()
+                        } else {
+                            "Configuration rechecked. Inspect the fresh verification results below."
+                                .into()
+                        }
                     } else {
                         format!(
                             "{failures} repair step(s) failed. Fresh check results are shown below."
@@ -448,11 +467,15 @@ impl Workbench {
                             Section::Apps,
                             Section::Network,
                             Section::Other,
+                            Section::Catalog,
                         ] {
-                            let count = self
-                                .report
-                                .as_ref()
-                                .map(|r| r.findings.iter().filter(|f| section.accepts(f)).count());
+                            let count = if section == Section::Catalog {
+                                Some(Repair::all().len())
+                            } else {
+                                self.report.as_ref().map(|r| {
+                                    r.findings.iter().filter(|f| section.accepts(f)).count()
+                                })
+                            };
                             let tint = self
                                 .report
                                 .as_ref()
@@ -596,25 +619,36 @@ impl Workbench {
         ui.horizontal_wrapped(|ui| {
             ui.heading(self.section.label());
             if ui
-                .add_enabled(!self.busy, egui::Button::new("Scan again"))
+                .add_enabled(!self.busy && !self.review, egui::Button::new("Scan again"))
                 .clicked()
             {
                 self.scan(ui.ctx());
             }
             if ui
                 .add_enabled(
-                    !self.busy && !self.selected.is_empty(),
+                    !self.busy && !self.review && !self.selected.is_empty(),
                     egui::Button::new(format!("Fix selected ({})", self.selected.len())),
                 )
                 .clicked()
             {
-                self.reviewed = self.selected.clone();
-                self.review = true;
                 self.consent = false;
+                if let Some(report) = &self.report {
+                    match engine::build_plan(&self.selected, report) {
+                        Ok(plan) => {
+                            self.reviewed = Some(plan);
+                            self.review = true;
+                        }
+                        Err(error) => {
+                            self.message = format!("Cannot create repair plan: {error:#}");
+                            self.message_error = true;
+                            self.reviewed = None;
+                        }
+                    }
+                }
             }
             if ui
                 .add_enabled(
-                    !self.busy && self.policy.network_allowed(),
+                    !self.busy && !self.review && self.policy.network_allowed(),
                     egui::Button::new("Prepare offline data"),
                 )
                 .clicked()
@@ -630,6 +664,32 @@ impl Workbench {
             },
             &self.message,
         );
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy && !self.review && self.report.is_some(),
+                    egui::Button::new("Select eligible repairs"),
+                )
+                .clicked()
+            {
+                if let Some(report) = &self.report {
+                    self.selected = eligible_repairs(report);
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.review && !self.selected.is_empty(),
+                    egui::Button::new("Clear selection"),
+                )
+                .clicked()
+            {
+                self.selected.clear();
+            }
+        });
+        if self.section == Section::Catalog {
+            self.catalog(ui);
+            return;
+        }
         let Some(report) = &self.report else {
             ui.add_space(20.0);
             ui.label(if self.busy {
@@ -663,9 +723,10 @@ impl Workbench {
                 &mut self.expanded,
                 &mut self.selected,
                 self.advanced,
-                self.busy,
+                self.busy || self.review,
                 self.low,
                 self.dark,
+                None,
             );
         }
         if self.section == Section::Apps {
@@ -698,9 +759,11 @@ impl Workbench {
         ui.weak("Coverage: local configuration checks. Advisory metadata does not establish CVE exposure.");
     }
     fn review_window(&mut self, ctx: &egui::Context) {
-        if !self.review {
+        if !self.review || self.reviewed.is_none() {
             return;
         }
+        let plan = self.reviewed.as_ref().unwrap();
+        let has_critical = plan.has_critical();
         let mut apply = false;
         let mut cancel = false;
         egui::Window::new("Review selected repairs")
@@ -708,22 +771,48 @@ impl Workbench {
             .resizable(true)
             .default_width(440.0_f32.min((ctx.content_rect().width() - 36.0).max(200.0)))
             .max_width((ctx.content_rect().width() - 36.0).max(200.0))
-            .max_height((ctx.content_rect().height() - 36.0).max(150.0))
+            .max_height((ctx.content_rect().height() - 76.0).max(120.0))
             .constrain_to(ctx.content_rect().shrink(12.0))
             .vscroll(true)
             .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                bounded_record(ui, &format!("Plan {}", plan.id()));
+                if ui.small_button("Copy plan").clicked() {
+                    ui.ctx().copy_text(plan_text(plan));
+                }
                 egui::ScrollArea::vertical()
-                    .max_height(240.0)
+                    .max_height((ctx.content_rect().height() - 210.0).clamp(56.0, 240.0))
                     .show(ui, |ui| {
-                        for repair in &self.reviewed {
-                            ui.strong(repair.id());
-                            ui.label(repair.impact());
-                            ui.add_space(10.0);
+                        for entry in plan.entries() {
+                            ui.add_space(6.0);
+                            ui.strong(&entry.name);
+                            ui.weak(format!(
+                                "Change risk: {} · {}",
+                                entry.risk.label(),
+                                if entry.restart_required {
+                                    "Restart required"
+                                } else {
+                                    "No restart specified"
+                                }
+                            ));
+                            bounded_record(ui, &format!("Current: {}", entry.before.evidence));
+                            bounded_record(ui, &format!("Exact change: {}", entry.action));
+                            ui.label(format!("Effect: {}", entry.impact));
+                            ui.label(format!("Manual recovery: {}", entry.rollback));
+                            bounded_record(ui, &format!("Source: {}", entry.source));
+                            ui.separator();
                         }
                     });
                 ui.separator();
-                ui.checkbox(&mut self.consent, "I approve these specific changes.");
-                ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut self.consent,
+                    if has_critical {
+                        "I approve this plan, including critical changes that may break access."
+                    } else {
+                        "I approve this plan."
+                    },
+                );
+                ui.horizontal_wrapped(|ui| {
                     apply = ui
                         .add_enabled(
                             self.consent && !self.busy,
@@ -736,9 +825,46 @@ impl Workbench {
         if cancel {
             self.review = false;
             self.consent = false;
+            self.reviewed = None;
         }
         if apply {
             self.apply(ctx);
+        }
+    }
+    fn catalog(&mut self, ui: &mut egui::Ui) {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.add_space(8.0);
+        ui.weak(format!(
+            "{} built-in repair procedures. Selection includes only current, eligible findings.",
+            Repair::all().len()
+        ));
+        ui.add_space(8.0);
+        for &repair in Repair::all() {
+            let current = self.report.as_ref().and_then(|report| {
+                report
+                    .findings
+                    .iter()
+                    .find(|finding| finding.id == repair.id() || finding.repair == Some(repair))
+            });
+            let finding = Finding {
+                id: repair.id().into(), name: repair.title().into(),
+                status: current.map(|f| f.status).unwrap_or(Status::Unknown),
+                evidence: current.map(|f| f.evidence.clone()).unwrap_or_else(|| "No current applicability result. Scan this computer before selecting a repair.".into()),
+                source: repair.source().into(),
+                repair: current.filter(|f| f.status == Status::NeedsAttention && f.repair == Some(repair)).map(|_| repair),
+                change_risk: current.and_then(|f| f.change_risk),
+            };
+            finding_row(
+                ui,
+                &finding,
+                &mut self.expanded,
+                &mut self.selected,
+                self.advanced,
+                self.busy || self.review,
+                self.low,
+                self.dark,
+                Some(repair.impact()),
+            );
         }
     }
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -911,7 +1037,11 @@ fn resize_edges(ui: &mut egui::Ui) {
 
 fn category(f: &Finding) -> Section {
     let text = format!("{} {}", f.id, f.name).to_ascii_lowercase();
-    if text.contains("firewall") || text.contains("network") || text.contains("smb") {
+    if text.contains("firewall")
+        || text.contains("network")
+        || text.contains("smb")
+        || text.contains("rdp")
+    {
         Section::Network
     } else if text.contains("inventory")
         || text.contains("application")
@@ -923,11 +1053,55 @@ fn category(f: &Finding) -> Section {
         || text.contains("update")
         || text.contains("defender")
         || text.contains("os-")
+        || text.contains("uac-")
+        || text.contains("msi-")
     {
         Section::Windows
     } else {
         Section::Other
     }
+}
+
+fn eligible_repairs(report: &Report) -> Vec<Repair> {
+    let mut repairs = Vec::new();
+    for finding in &report.findings {
+        if finding.status == Status::NeedsAttention {
+            if let Some(repair) = finding.repair {
+                if !repairs.contains(&repair) {
+                    repairs.push(repair);
+                }
+            }
+        }
+    }
+    repairs
+}
+
+fn approve_review(plan: &RepairPlan, consent: bool) -> anyhow::Result<engine::PlanApproval> {
+    if !consent {
+        anyhow::bail!("Approve the displayed plan before applying changes");
+    }
+    engine::approve_plan(plan, plan.has_critical())
+}
+
+fn plan_text(plan: &RepairPlan) -> String {
+    let mut text = format!("Repair plan {}\n", plan.id());
+    for entry in plan.entries() {
+        text.push_str(&format!("\n{} [{}]\nRisk: {}\nCurrent: {}\nExact change: {}\nEffect: {}\nRestart required: {}\nManual recovery: {}\nSource: {}\n", entry.name, entry.repair.id(), entry.risk.label(), entry.before.evidence, entry.action, entry.impact, entry.restart_required, entry.rollback, entry.source));
+    }
+    text
+}
+
+/// Evidence identifiers and paths can contain no word boundaries. Keep the full
+/// selectable value while allowing character-level wrapping inside the pane.
+fn bounded_record(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().text_color(),
+        ui.available_width(),
+    );
+    job.wrap.break_anywhere = true;
+    ui.add(egui::Label::new(job).wrap().selectable(true))
 }
 
 #[derive(Clone, Copy)]
@@ -946,6 +1120,13 @@ fn short_name(finding: &Finding) -> &str {
         "windows-firewall" => "Windows Firewall",
         "advisory-coverage" => "Vulnerability coverage",
         "inventory" => "Registered apps",
+        "uac-enable" => "User Account Control",
+        "uac-secure-desktop" => "UAC secure desktop",
+        "uac-admin-consent" => "Elevation consent",
+        "msi-no-elevated-machine" => "Elevated MSI (machine)",
+        "msi-no-elevated-user" => "Elevated MSI (account)",
+        "smb-no-insecure-guest" => "SMB guest logons",
+        "rdp-require-nla" => "RDP authentication",
         _ => &finding.name,
     }
 }
@@ -960,6 +1141,7 @@ fn finding_row(
     busy: bool,
     low: bool,
     dark: bool,
+    catalog_impact: Option<&str>,
 ) -> FindingRowLayout {
     let width = ui.available_width();
     let repair = finding
@@ -1118,10 +1300,37 @@ fn finding_row(
             })
             .show(ui, |ui| {
                 ui.label(RichText::new(&finding.name).strong());
-                ui.label(&finding.evidence);
-                ui.weak(format!("Source: {}", finding.source));
+                bounded_record(ui, &finding.evidence);
+                bounded_record(ui, &format!("Source: {}", finding.source));
                 if advanced {
                     ui.monospace(&finding.id);
+                }
+            });
+    }
+    if let Some(repair) = Repair::from_id(&finding.id) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 36,
+                right: 12,
+                top: 0,
+                bottom: 8,
+            })
+            .show(ui, |ui| {
+                ui.weak(format!(
+                    "Change risk: {}{}",
+                    finding
+                        .change_risk
+                        .unwrap_or(repair.risk())
+                        .max(repair.risk())
+                        .label(),
+                    if repair.restart_required() {
+                        " · Restart required"
+                    } else {
+                        ""
+                    }
+                ));
+                if let Some(impact) = catalog_impact {
+                    ui.label(impact);
                 }
             });
     }
@@ -1275,6 +1484,62 @@ mod finding_row_tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn review_identifiers_and_sources_wrap_at_minimum_window_size() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 320.0));
+        let values = [
+            format!("Plan {}", "a".repeat(64)),
+            format!(
+                "Exact change: HKLM\\{}\\Value DWORD 0 -> 1",
+                "LongPolicySegment\\".repeat(14)
+            ),
+            format!(
+                "Source: https://learn.microsoft.com/{}",
+                "long-unbroken-source-path".repeat(18)
+            ),
+        ];
+        let mut labels_fit = true;
+        let mut window = egui::Rect::NOTHING;
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    let context = ui.ctx().clone();
+                    if let Some(shown) = egui::Window::new("Review layout check")
+                        .default_width(440.0)
+                        .max_width(444.0)
+                        .max_height(244.0)
+                        .constrain_to(screen.shrink(12.0))
+                        .vscroll(true)
+                        .show(&context, |ui| {
+                            for text in &values {
+                                let available = ui.available_rect_before_wrap();
+                                let label = bounded_record(ui, text);
+                                labels_fit &= label.rect.left() >= available.left() - 0.5
+                                    && label.rect.right() <= available.right() + 0.5;
+                            }
+                        })
+                    {
+                        window = shown.response.rect;
+                    }
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(
+            labels_fit,
+            "Full identifiers must wrap rather than widen the review"
+        );
+        assert!(
+            screen.contains_rect(window),
+            "Review must remain inside the 480x320 window"
+        );
+    }
+
     fn finding() -> Finding {
         Finding {
             id: "firewall-private".into(),
@@ -1283,7 +1548,64 @@ mod finding_row_tests {
             evidence: "Local profile disabled; no external reachability verdict.".into(),
             source: "Windows Firewall policy".into(),
             repair: Some(Repair::EnablePrivateFirewall),
+            change_risk: None,
         }
+    }
+    #[test]
+    fn bulk_selection_excludes_passed_unknown_and_duplicates() {
+        let eligible = finding();
+        let mut passed = finding();
+        passed.status = Status::Passed;
+        passed.repair = Some(Repair::EnablePublicFirewall);
+        let mut unknown = finding();
+        unknown.status = Status::Unknown;
+        unknown.repair = Some(Repair::EnableDomainFirewall);
+        let report = Report {
+            os: Default::default(),
+            apps: vec![],
+            findings: vec![eligible.clone(), eligible, passed, unknown],
+        };
+        assert_eq!(
+            eligible_repairs(&report),
+            vec![Repair::EnablePrivateFirewall]
+        );
+    }
+    #[test]
+    fn critical_plan_requires_explicit_review_consent() {
+        let action = Repair::RequireRdpNla;
+        let report = Report {
+            os: Default::default(),
+            apps: vec![],
+            findings: vec![Finding {
+                id: action.id().into(),
+                name: action.title().into(),
+                status: Status::NeedsAttention,
+                evidence: "UserAuthentication=0".into(),
+                source: action.source().into(),
+                repair: Some(action),
+                change_risk: None,
+            }],
+        };
+        let plan = engine::build_plan(&[action], &report).unwrap();
+        assert!(plan.has_critical());
+        assert!(approve_review(&plan, false).is_err());
+        assert!(approve_review(&plan, true).is_ok());
+    }
+    #[test]
+    fn copied_review_uses_frozen_evidence_not_later_report_state() {
+        let action = Repair::EnablePrivateFirewall;
+        let mut report = Report {
+            os: Default::default(),
+            apps: vec![],
+            findings: vec![finding()],
+        };
+        let plan = engine::build_plan(&[action], &report).unwrap();
+        let snapshot = plan_text(&plan);
+        report.findings[0].evidence = "changed after plan creation".into();
+        report.findings[0].status = Status::Passed;
+        assert_eq!(plan_text(&plan), snapshot);
+        assert!(!snapshot.contains("changed after plan creation"));
+        assert!(snapshot.contains(action.action_description()));
     }
     fn frame(
         ctx: &egui::Context,
@@ -1314,6 +1636,7 @@ mod finding_row_tests {
                     busy,
                     true,
                     false,
+                    None,
                 ));
             });
         });

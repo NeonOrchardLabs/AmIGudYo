@@ -233,6 +233,7 @@ mod native {
                             ),
                             source: "Windows Firewall INetFwPolicy2 (local policy)".into(),
                             repair: (!enabled && modifiable && confirmed_client).then_some(repair),
+                            change_risk: None,
                         }
                     }
                     Err(error) => Finding {
@@ -242,6 +243,7 @@ mod native {
                         evidence: format!("{base}Profile could not be read: {error}"),
                         source: "Windows Firewall INetFwPolicy2 (local policy)".into(),
                         repair: None,
+                        change_risk: None,
                     },
                 }
             }).collect())
@@ -257,6 +259,7 @@ mod native {
                     evidence: format!("Native firewall probe unavailable: {error:#}"),
                     source: "Windows Firewall INetFwPolicy2 (local policy)".into(),
                     repair: None,
+                    change_risk: None,
                 })
                 .collect(),
         }
@@ -343,6 +346,7 @@ pub fn scan_checks() -> Vec<Finding> {
         evidence: "Native Windows checks are unavailable on this operating system".into(),
         source: "Platform capability".into(),
         repair: None,
+        change_risk: None,
     }]
 }
 

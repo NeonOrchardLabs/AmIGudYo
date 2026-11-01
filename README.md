@@ -1,7 +1,7 @@
 # Am I Good? (Working Name)
 
 Portable Rust application for visible Windows security checks and approved repairs.
-Development build: `0.1.0-dev.4`.
+Development build: `0.1.0-dev.5`.
 
 ## Run
 
@@ -41,11 +41,38 @@ manually once. The app cannot safely infer whether those older builds are busy.
 
 ## Current Scope
 
+The Repairs view lists all ten implemented actions, including current
+applicability, change risk, impact and recovery instructions. Select eligible
+repairs together and approve one reviewed plan. Critical changes have an
+explicit plan-wide acknowledgment; they are available when applicability is
+verified. Known local Group Policy registry overrides are marked Critical and
+disclose that policy refresh may reapply the old value; these actions do not
+rewrite the policy source. Domain/MDM-managed or unverifiable targets cannot be
+forced into a plan.
+
+Each plan has a content ID covering the observed evidence and proposed actions.
+Approval is tied to that snapshot. Changed evidence requires a new review.
+Actions run sequentially and stop after a failure; each configured result is
+read back independently. Restart-required settings stay described as configured
+changes, with runtime activation still unverified. Recovery instructions are
+manual; the application does not provide automatic rollback.
+
+```powershell
+.\amigood.exe --catalog
+.\amigood.exe --plan firewall-private,rdp-require-nla --noexternal --no-log
+# After reviewing an applicable plan, --fix requires --approve.
+# Critical plans also require --approve-critical. --plan-id can bind a CLI run
+# to a previously copied plan ID. No approval authorizes future unseen actions.
+```
+
 - Reads Domain, Private and Public Windows Firewall local policy through COM.
 - Inventories registered desktop applications through the Windows registry.
 - Can enable selected eligible firewall profiles on confirmed desktop Windows,
   with explicit approval, fresh eligibility checks and separate verification.
 - Refuses firewall changes on Server or unclassified installations.
+- Adds native UAC, MSI elevated-install policy, SMB guest and RDP NLA checks and
+  typed repairs on verified unmanaged Windows clients. Unknown values, missing
+  undocumented defaults, registry links and domain/MDM policy targets are withheld.
 - Reports uncertain or unsupported checks explicitly.
 
 No CVE affected-version matcher or AI model is included yet. Coverage dates are

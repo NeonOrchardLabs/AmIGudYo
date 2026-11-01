@@ -5,7 +5,7 @@ use amigood::{
     bundle,
     cli::{HELP, Options},
     engine,
-    model::{Repair, Status},
+    model::Repair,
     platform,
     policy::{Mode, Policy},
 };
@@ -36,6 +36,11 @@ fn main() -> Result<()> {
     let options = Options::parse(std::env::args().skip(1))?;
     if options.help {
         print!("{HELP}");
+        return Ok(());
+    }
+    if options.catalog {
+        let catalog: Vec<_> = Repair::all().iter().map(|r|serde_json::json!({"id":r.id(),"name":r.title(),"risk":r.risk(),"action":r.action_description(),"impact":r.impact(),"recovery":r.rollback(),"restart_required":r.restart_required(),"source":r.source()})).collect();
+        println!("{}", serde_json::to_string_pretty(&catalog)?);
         return Ok(());
     }
 
@@ -101,34 +106,23 @@ fn main() -> Result<()> {
         );
     }
     println!(
-        "Scope: Windows Firewall local policy, registered desktop-software inventory, and advisory-data availability. No CVE affected-version matcher is present; results do not establish complete vulnerability coverage."
+        "Scope: supported local Windows configuration checks, registered software inventory, and advisory-data availability. No CVE affected-version matcher is present; results do not establish complete vulnerability coverage."
     );
 
     let report = engine::scan_with_policy(&policy, &mut audit);
     println!("{}", serde_json::to_string_pretty(&report)?);
 
-    if let Some(repairs) = options.fix.as_deref() {
-        ensure_fresh_candidates(repairs, &report.findings)?;
-        println!("\nCombined repair review — explicit --approve was supplied for this exact set:");
-        for repair in repairs {
-            println!("- {}: {}", repair.id(), repair.impact());
+    if let Some(repairs) = options.plan.as_deref().or(options.fix.as_deref()) {
+        let plan = engine::build_plan(repairs, &report)?;
+        println!("\nReviewed plan:\n{}", serde_json::to_string_pretty(&plan)?);
+        if options.plan.is_some() {
+            return Ok(());
         }
-        println!(
-            "Actions will run in order; a failed action stops later actions. Each selected action requires a fresh eligibility check and post-change local verification. Remote access and service availability are not tested."
-        );
-
-        audit.log(
-            "CONSENT",
-            format!(
-                "User supplied explicit --approve for {}",
-                repairs
-                    .iter()
-                    .map(|repair| repair.id())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        );
-        let results = engine::repair_batch(repairs, &mut audit);
+        if options.plan_id.as_deref().is_some_and(|id| id != plan.id()) {
+            bail!("Plan ID differs from the requested review; no changes were attempted");
+        }
+        let approval = engine::approve_plan(&plan, options.approve_critical)?;
+        let results = engine::execute_plan(&plan, &approval, &mut audit);
         let mut failed = false;
         for (repair, result) in results {
             match result {
@@ -146,21 +140,6 @@ fn main() -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-fn ensure_fresh_candidates(repairs: &[Repair], findings: &[amigood::model::Finding]) -> Result<()> {
-    for repair in repairs {
-        let eligible = findings.iter().any(|finding| {
-            finding.status == Status::NeedsAttention && finding.repair == Some(*repair)
-        });
-        if !eligible {
-            bail!(
-                "Repair {} is not an eligible NeedsAttention result in the fresh scan; no repairs were run",
-                repair.id()
-            );
-        }
-    }
     Ok(())
 }
 

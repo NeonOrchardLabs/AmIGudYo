@@ -10,3 +10,4 @@ pub mod jewel;
 pub mod model;
 pub mod platform;
 pub mod policy;
+pub mod recipes;

@@ -16,8 +16,12 @@ Usage: amigood [OPTIONS]\n\
   --lowgraphics       Use the low-graphics interface.\n\
   --fix ID[,ID...]    Select built-in repairs, for example firewall-private.\n\
   --approve           Explicitly approve exactly the --fix set; required with --fix.\n\
+  --approve-critical  Also approve critical changes in that exact batch.\n\
+  --plan ID[,ID...]    Preview an eligible repair plan without changing settings.\n\
+  --plan-id SHA256     Require --fix to match a previously reviewed plan ID.\n\
+  --catalog           List all implemented repair actions and risk levels.\n\
 \n\
-Checks currently include Windows Firewall local policy (domain/private/public),\n\
+Checks include local firewall, UAC, installer, SMB guest and RDP policy,\n\
 registered desktop-software inventory, and advisory-data availability. There is\n\
 no CVE affected-version matcher; this is not an all-CVE scanner or a complete\n\
 security guarantee. Firewall changes can interrupt remote management or services;\n\
@@ -33,6 +37,10 @@ pub struct Options {
     pub airgapready: bool,
     pub fix: Option<Vec<Repair>>,
     pub approve: bool,
+    pub approve_critical: bool,
+    pub plan: Option<Vec<Repair>>,
+    pub plan_id: Option<String>,
+    pub catalog: bool,
 }
 
 impl Options {
@@ -47,6 +55,10 @@ impl Options {
             airgapready: false,
             fix: None,
             approve: false,
+            approve_critical: false,
+            plan: None,
+            plan_id: None,
+            catalog: false,
         };
 
         let mut args = args.into_iter();
@@ -59,6 +71,29 @@ impl Options {
                 "--lowgraphics" => options.lowgraphics = true,
                 "--airgapready" => options.airgapready = true,
                 "--approve" => options.approve = true,
+                "--approve-critical" => options.approve_critical = true,
+                "--catalog" => options.catalog = true,
+                "--plan" => {
+                    if options.plan.is_some() {
+                        bail!("--plan may be specified only once");
+                    }
+                    let ids = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--plan requires repair IDs"))?;
+                    options.plan = Some(parse_repairs(&ids)?);
+                }
+                "--plan-id" => {
+                    if options.plan_id.is_some() {
+                        bail!("--plan-id may be specified only once");
+                    }
+                    let id = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--plan-id requires a SHA-256 ID"))?;
+                    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        bail!("--plan-id requires a 64-character hexadecimal ID");
+                    }
+                    options.plan_id = Some(id.to_ascii_lowercase());
+                }
                 "--fix" => {
                     if options.fix.is_some() {
                         bail!(
@@ -80,17 +115,31 @@ impl Options {
                 "--noexternal and --airgapready are incompatible: offline preparation requires network and storage"
             );
         }
-        if options.airgapready && (options.scan || options.fix.is_some()) {
+        if options.airgapready
+            && (options.scan || options.fix.is_some() || options.plan.is_some() || options.catalog)
+        {
             bail!(
                 "--airgapready is a preparation-only operation and cannot be combined with --scan or --fix"
             );
+        }
+        if options.plan.is_some() && options.fix.is_some() {
+            bail!("Choose --plan preview or --fix, not both");
+        }
+        if options.catalog && (options.scan || options.plan.is_some() || options.fix.is_some()) {
+            bail!("--catalog is a listing-only operation");
+        }
+        if options.approve_critical && (!options.approve || options.fix.is_none()) {
+            bail!("--approve-critical requires --fix and --approve");
+        }
+        if options.plan_id.is_some() && options.fix.is_none() {
+            bail!("--plan-id requires --fix");
         }
         match (&options.fix, options.approve) {
             (Some(_), false) => bail!("--fix requires explicit --approve; no repair was run"),
             (None, true) => bail!("--approve requires --fix; no repair was run"),
             _ => {}
         }
-        if options.fix.is_some() {
+        if options.fix.is_some() || options.plan.is_some() {
             // A repair is always gated by a fresh scan in main, regardless of --scan.
             options.scan = true;
         }
@@ -178,5 +227,40 @@ mod tests {
         assert!(options.scan);
         assert!(!options.noexternal);
         assert!(HELP.contains("no CVE affected-version matcher"));
+    }
+    #[test]
+    fn preview_and_catalog_do_not_authorize_execution() {
+        let preview = parse(&["--plan", "rdp-require-nla"]).unwrap();
+        assert!(
+            preview.scan && preview.plan.is_some() && preview.fix.is_none() && !preview.approve
+        );
+        let catalog = parse(&["--catalog"]).unwrap();
+        assert!(catalog.catalog && !catalog.scan && !catalog.approve);
+        assert!(parse(&["--plan", "rdp-require-nla", "--approve"]).is_err());
+        assert!(parse(&["--catalog", "--scan"]).is_err());
+        assert!(parse(&["--plan-id", "bad"]).is_err());
+    }
+    #[test]
+    fn critical_approval_requires_a_named_approved_fix_set() {
+        assert!(parse(&["--approve-critical"]).is_err());
+        assert!(parse(&["--fix", "rdp-require-nla", "--approve-critical"]).is_err());
+        let options = parse(&[
+            "--fix",
+            "rdp-require-nla",
+            "--approve",
+            "--approve-critical",
+        ])
+        .unwrap();
+        assert!(options.approve_critical && options.approve && options.fix.is_some());
+        assert!(
+            parse(&[
+                "--plan",
+                "rdp-require-nla",
+                "--fix",
+                "rdp-require-nla",
+                "--approve"
+            ])
+            .is_err()
+        );
     }
 }
