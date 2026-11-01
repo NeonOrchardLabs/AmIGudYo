@@ -11,3 +11,5 @@ pub mod model;
 pub mod platform;
 pub mod policy;
 pub mod recipes;
+pub mod update_plan;
+pub mod updates;

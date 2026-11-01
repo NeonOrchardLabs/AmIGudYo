@@ -530,6 +530,10 @@ mod native {
             .collect()
     }
 
+    pub(crate) fn local_client_repair_context() -> Result<bool> {
+        eligible_client_context().map(|context| context.local_policy)
+    }
+
     pub fn apply_repair(repair: Repair) -> Result<String> {
         let recipe = recipe(repair).context("Not a built-in registry recipe")?;
         let context_before = eligible_client_context()
@@ -575,6 +579,8 @@ mod native {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use native::local_client_repair_context;
 #[cfg(windows)]
 pub use native::{apply_repair, scan_checks};
 

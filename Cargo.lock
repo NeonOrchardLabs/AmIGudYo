@@ -37,7 +37,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amigood"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 dependencies = [
  "anyhow",
  "eframe",

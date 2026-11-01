@@ -1,7 +1,7 @@
 # Am I Good? (Working Name)
 
 Portable Rust application for visible Windows security checks and approved repairs.
-Development build: `0.1.0-dev.5`.
+Development build: `0.1.0-dev.6`.
 
 ## Run
 
@@ -79,6 +79,38 @@ No CVE affected-version matcher or AI model is included yet. Coverage dates are
 not established. An enabled local firewall setting is not proof of effective
 network protection or safe rules. Repairs may interrupt remote connections and
 may require administrator rights; the program does not elevate automatically.
+
+## Windows Update Applicability
+
+The app can now ask Windows Update Agent to evaluate its update metadata instead
+of relying on ten hand-written configuration checks. This does not establish a
+count of CVEs checked or complete third-party coverage.
+
+- **Check cached updates** / `--updates`: reads local OS update metadata. Cache
+  freshness stays unknown; zero results do not mean the machine is fully patched.
+- **Refresh update data** / `--updates-online`: explicitly queries the configured
+  update service, sends Windows applicability information, and refreshes Windows'
+  own cache. The app requests no update payload download. Managed sources are
+  preserved rather than bypassed.
+- **Review cached installs**: select exact update identities and revisions and
+  approve a Critical plan. Only already-downloaded, previously license-accepted,
+  noninteractive content can be installed. Native checks also inspect bundled
+  components. Unknown eligibility, managed/unverified clients and Server targets
+  are withheld from installation.
+
+CLI previews use `--plan-updates GUID@revision[,GUID@revision...]`. Execution uses
+`--install-updates` with `--approve --approve-critical`; optional `--plan-id` binds
+the run to a reviewed snapshot. Configuration and update plans are separate.
+Every update is rechecked before installation, then independently checked for
+installed state. Failure or a pending restart stops the remaining batch. No
+automatic license acceptance, download, elevation, restart or rollback occurs.
+Some updates cannot be uninstalled. Native search/install calls may take time.
+
+`--noexternal` permits cached OS metadata inspection but refuses installation of
+nonembedded update payloads. Embedded configuration repairs remain available.
+Windows owns the update cache and servicing logs; these are separate from the
+app's portable files. Signed offline CAB import and payload preparation are not
+implemented. No trained AI model is bundled.
 
 ## Portable And Offline
 

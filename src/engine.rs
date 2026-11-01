@@ -95,6 +95,100 @@ pub fn scan_with_policy(policy: &crate::policy::Policy, audit: &mut Audit) -> Re
     report
 }
 
+/// Explicit native cached-data inspection. It never requests an online search.
+pub fn scan_cached_updates(audit: &mut Audit) -> (Vec<Finding>, String) {
+    let (_, findings, message) = scan_cached_update_report(audit);
+    (findings, message)
+}
+
+pub fn scan_cached_update_report(
+    audit: &mut Audit,
+) -> (Option<crate::updates::UpdateReport>, Vec<Finding>, String) {
+    audit.log("CHECK", "Checking applicability against Windows Update Agent's cached metadata; no online search or installation requested");
+    match crate::updates::inspect_cached() {
+        Ok(report) => {
+            let message = report.summary();
+            let findings = report.findings();
+            for finding in &findings {
+                audit.log(
+                    "RESULT",
+                    format!(
+                        "{} status={:?} | {}",
+                        finding.id, finding.status, finding.evidence
+                    ),
+                );
+            }
+            audit.log("COVERAGE", &message);
+            (Some(report), findings, message)
+        }
+        Err(error) => {
+            let message = format!(
+                "Cached update applicability unavailable: {error:#}. No online search, download or installation was requested; freshness and missing-update coverage remain unknown."
+            );
+            audit.log("WARN", &message);
+            (
+                None,
+                vec![Finding {
+                    id: "windows-update-coverage".into(),
+                    name: "Windows update applicability".into(),
+                    status: Status::Unknown,
+                    evidence: message.clone(),
+                    source: "Windows Update Agent (cached metadata)".into(),
+                    repair: None,
+                    change_risk: None,
+                }],
+                message,
+            )
+        }
+    }
+}
+
+/// Explicit connected refresh; a second cached query supplies the review snapshot.
+pub fn refresh_update_report(
+    policy: &crate::policy::Policy,
+    audit: &mut Audit,
+) -> (Option<crate::updates::UpdateReport>, Vec<Finding>, String) {
+    let result = (|| -> Result<()> {
+        policy.require_network()?;
+        audit.log("NETWORK", "Refreshing applicability from the configured Windows update service. Windows sends applicability information and maintains its own cache; this app requests no update payload download or installation");
+        let report = crate::updates::inspect_online()?;
+        if !report.complete {
+            bail!(
+                "Configured update service returned an incomplete applicability result; issues={}",
+                report.issues.len()
+            );
+        }
+        audit.log("RESULT", format!("Connected applicability query completed; returned_updates={}. This is not a CVE coverage count", report.updates.len()));
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            let (report, findings, message) = scan_cached_update_report(audit);
+            let message = format!("Configured-service refresh completed. {message}");
+            (report, findings, message)
+        }
+        Err(error) => {
+            let message = format!(
+                "Update data refresh unavailable: {error:#}. No update installation was requested; use cached checks separately if needed."
+            );
+            audit.log("WARN", &message);
+            (
+                None,
+                vec![Finding {
+                    id: "windows-update-coverage".into(),
+                    name: "Windows update data".into(),
+                    status: Status::Unknown,
+                    evidence: message.clone(),
+                    source: crate::updates::SOURCE.into(),
+                    repair: None,
+                    change_risk: None,
+                }],
+                message,
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PlannedRepair {
     pub repair: Repair,
@@ -336,6 +430,18 @@ fn execute_plan_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedded_mode_blocks_update_refresh_before_native_network_query() {
+        let policy = crate::policy::Policy {
+            mode: crate::policy::Mode::EmbeddedOnly,
+            logging: false,
+        };
+        let (report, findings, message) =
+            refresh_update_report(&policy, &mut Audit::new(false, None).unwrap());
+        assert!(report.is_none());
+        assert_eq!(findings[0].status, Status::Unknown);
+        assert!(message.contains("--noexternal"));
+    }
     fn finding(r: Repair, status: Status) -> Finding {
         Finding {
             id: r.id().into(),

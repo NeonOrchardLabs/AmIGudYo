@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     };
     let os = platform::detect_os();
     let server_core_fallback = os.is_server && !os.has_desktop;
-    let headless = options.scan || options.fix.is_some() || server_core_fallback;
+    let headless = options.scan || options.updates || options.fix.is_some() || server_core_fallback;
     let audit_path = if options.no_log || options.noexternal {
         None
     } else {
@@ -109,8 +109,48 @@ fn main() -> Result<()> {
         "Scope: supported local Windows configuration checks, registered software inventory, and advisory-data availability. No CVE affected-version matcher is present; results do not establish complete vulnerability coverage."
     );
 
-    let report = engine::scan_with_policy(&policy, &mut audit);
+    let mut report = engine::scan_with_policy(&policy, &mut audit);
+    let mut cached_updates = None;
+    if options.updates {
+        let (updates, findings, _) = if options.updates_online {
+            engine::refresh_update_report(&policy, &mut audit)
+        } else {
+            engine::scan_cached_update_report(&mut audit)
+        };
+        cached_updates = updates;
+        report.findings.extend(findings);
+    }
     println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if let Some(keys) = options
+        .update_plan
+        .as_deref()
+        .or(options.install_updates.as_deref())
+    {
+        let updates = cached_updates
+            .as_ref()
+            .context("A complete cached update report is unavailable; no install attempted")?;
+        let plan = amigood::update_plan::build_plan(updates, keys, &report.os)?;
+        println!(
+            "\nReviewed critical update plan:\n{}",
+            serde_json::to_string_pretty(&plan)?
+        );
+        if options.update_plan.is_some() {
+            return Ok(());
+        }
+        if options.plan_id.as_deref().is_some_and(|id| id != plan.id()) {
+            bail!("Update plan ID differs from the reviewed ID; no install attempted");
+        }
+        let approval = amigood::update_plan::approve_plan(&plan, options.approve_critical)?;
+        let outcomes = amigood::update_plan::execute_plan(&plan, &approval, &policy, &mut audit);
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+        if outcomes.iter().any(|result| !result.verified) {
+            bail!(
+                "Update batch stopped or was not fully verified; inspect results before retrying. Changes may have occurred"
+            );
+        }
+        return Ok(());
+    }
 
     if let Some(repairs) = options.plan.as_deref().or(options.fix.as_deref()) {
         let plan = engine::build_plan(repairs, &report)?;

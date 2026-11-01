@@ -7,6 +7,13 @@ Usage: amigood [OPTIONS]\n\
 \n\
   --help              Show this help.\n\
   --scan              Run supported local checks without opening the GUI.\n\
+  --updates           Check applicability using Windows' cached update metadata.\n\
+                      No online search, download, or install; freshness is unknown.\n\
+  --updates-online    Refresh from the configured update service, then inspect\n\
+                      cached applicability. Sends Windows applicability data.\n\
+  --plan-updates IDS  Preview exact update GUID@revision IDs (comma-separated).\n\
+  --install-updates IDS Install reviewed, already-downloaded updates; requires\n\
+                      --approve and --approve-critical. Never downloads/restarts.\n\
   --noexternal        Use embedded resources only; no network, helper processes,\n\
                       sidecars, or app-owned persistent files. Logs stay in memory.\n\
   --airgapready       Prepare offline-use data while connected. Cannot be combined\n\
@@ -41,6 +48,10 @@ pub struct Options {
     pub plan: Option<Vec<Repair>>,
     pub plan_id: Option<String>,
     pub catalog: bool,
+    pub updates: bool,
+    pub updates_online: bool,
+    pub update_plan: Option<Vec<String>>,
+    pub install_updates: Option<Vec<String>>,
 }
 
 impl Options {
@@ -59,6 +70,10 @@ impl Options {
             plan: None,
             plan_id: None,
             catalog: false,
+            updates: false,
+            updates_online: false,
+            update_plan: None,
+            install_updates: None,
         };
 
         let mut args = args.into_iter();
@@ -66,6 +81,26 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => options.help = true,
                 "--scan" => options.scan = true,
+                "--updates" => options.updates = true,
+                "--updates-online" => {
+                    options.updates = true;
+                    options.updates_online = true;
+                }
+                "--plan-updates" | "--install-updates" => {
+                    let ids = args.next().ok_or_else(|| {
+                        anyhow::anyhow!("{arg} requires exact update GUID@revision IDs")
+                    })?;
+                    let slot = if arg == "--plan-updates" {
+                        &mut options.update_plan
+                    } else {
+                        &mut options.install_updates
+                    };
+                    if slot.is_some() {
+                        bail!("{arg} may be specified only once");
+                    }
+                    *slot = Some(parse_update_keys(&ids)?);
+                    options.updates = true;
+                }
                 "--noexternal" => options.noexternal = true,
                 "--no-log" => options.no_log = true,
                 "--lowgraphics" => options.lowgraphics = true,
@@ -110,13 +145,27 @@ impl Options {
             }
         }
 
+        if options.noexternal && options.updates_online {
+            bail!(
+                "--noexternal disables online update queries; --updates can inspect local OS metadata"
+            );
+        }
+        if options.noexternal && options.install_updates.is_some() {
+            bail!(
+                "--noexternal cannot install nonembedded Windows Update payloads. Embedded configuration repairs remain available"
+            );
+        }
         if options.noexternal && options.airgapready {
             bail!(
                 "--noexternal and --airgapready are incompatible: offline preparation requires network and storage"
             );
         }
         if options.airgapready
-            && (options.scan || options.fix.is_some() || options.plan.is_some() || options.catalog)
+            && (options.scan
+                || options.updates
+                || options.fix.is_some()
+                || options.plan.is_some()
+                || options.catalog)
         {
             bail!(
                 "--airgapready is a preparation-only operation and cannot be combined with --scan or --fix"
@@ -125,19 +174,35 @@ impl Options {
         if options.plan.is_some() && options.fix.is_some() {
             bail!("Choose --plan preview or --fix, not both");
         }
-        if options.catalog && (options.scan || options.plan.is_some() || options.fix.is_some()) {
+        if options.update_plan.is_some() && options.install_updates.is_some() {
+            bail!("Choose --plan-updates preview or --install-updates, not both");
+        }
+        if options.catalog
+            && (options.scan || options.updates || options.plan.is_some() || options.fix.is_some())
+        {
             bail!("--catalog is a listing-only operation");
         }
-        if options.approve_critical && (!options.approve || options.fix.is_none()) {
-            bail!("--approve-critical requires --fix and --approve");
+        if options.updates && (options.fix.is_some() || options.plan.is_some()) {
+            bail!("Run cached update checks separately from configuration repair plans");
         }
-        if options.plan_id.is_some() && options.fix.is_none() {
-            bail!("--plan-id requires --fix");
+        if options.approve_critical
+            && (!options.approve || (options.fix.is_none() && options.install_updates.is_none()))
+        {
+            bail!("--approve-critical requires an explicit install/fix set and --approve");
         }
-        match (&options.fix, options.approve) {
-            (Some(_), false) => bail!("--fix requires explicit --approve; no repair was run"),
-            (None, true) => bail!("--approve requires --fix; no repair was run"),
+        if options.plan_id.is_some() && options.fix.is_none() && options.install_updates.is_none() {
+            bail!("--plan-id requires --fix or --install-updates");
+        }
+        let execution = options.fix.is_some() || options.install_updates.is_some();
+        match (execution, options.approve) {
+            (true, false) => bail!("Execution requires explicit --approve; no repair was run"),
+            (false, true) => {
+                bail!("--approve requires an explicit install/fix set; no repair was run")
+            }
             _ => {}
+        }
+        if options.install_updates.is_some() && !options.approve_critical {
+            bail!("--install-updates requires --approve-critical for its exact critical plan");
         }
         if options.fix.is_some() || options.plan.is_some() {
             // A repair is always gated by a fresh scan in main, regardless of --scan.
@@ -146,6 +211,21 @@ impl Options {
 
         Ok(options)
     }
+}
+
+fn parse_update_keys(ids: &str) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for key in ids.split(',').map(str::trim) {
+        if !crate::update_plan::valid_key(key) {
+            bail!("Expected exact update GUID@revision, not a title, KB number or query");
+        }
+        let key = key.to_ascii_lowercase();
+        if keys.contains(&key) {
+            bail!("Duplicate update identity@revision");
+        }
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 fn parse_repairs(ids: &str) -> Result<Vec<Repair>> {
@@ -262,5 +342,45 @@ mod tests {
             ])
             .is_err()
         );
+    }
+    #[test]
+    fn cached_update_inspection_does_not_authorize_repairs_or_network() {
+        let options = parse(&["--updates", "--noexternal", "--no-log"]).unwrap();
+        assert!(options.updates && options.noexternal && options.no_log);
+        assert!(options.fix.is_none() && options.plan.is_none() && !options.approve);
+        assert!(parse(&["--updates", "--catalog"]).is_err());
+        assert!(parse(&["--updates", "--airgapready"]).is_err());
+        assert!(parse(&["--updates", "--fix", "firewall-private", "--approve"]).is_err());
+        assert!(parse(&["--updates-online", "--noexternal"]).is_err());
+        assert!(parse(&["--updates-online"]).unwrap().updates);
+    }
+    #[test]
+    fn update_installation_requires_exact_ids_and_critical_approval() {
+        let key = "00000000-0000-0000-0000-000000000001@1";
+        let preview = parse(&["--plan-updates", key]).unwrap();
+        assert!(preview.updates && preview.install_updates.is_none() && !preview.approve);
+        assert!(parse(&["--install-updates", key]).is_err());
+        assert!(parse(&["--install-updates", key, "--approve"]).is_err());
+        assert!(parse(&["--plan-updates", key, "--approve"]).is_err());
+        assert!(
+            parse(&[
+                "--install-updates",
+                "KB123456",
+                "--approve",
+                "--approve-critical"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "--install-updates",
+                key,
+                "--approve",
+                "--approve-critical",
+                "--noexternal"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--install-updates", key, "--approve", "--approve-critical"]).is_ok());
     }
 }

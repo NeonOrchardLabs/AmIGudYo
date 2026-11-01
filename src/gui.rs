@@ -6,6 +6,8 @@ use crate::{
     jewel::jewel,
     model::{Finding, Repair, Status},
     policy::Policy,
+    update_plan::{self, UpdatePlan},
+    updates::UpdateReport,
 };
 use anyhow::Result;
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
@@ -96,7 +98,26 @@ enum Message {
     Scanned(Report),
     Repaired(Report, Vec<(Repair, std::result::Result<String, String>)>),
     Prepared(Report, std::result::Result<String, String>),
+    CachedUpdates(Option<UpdateReport>, Vec<Finding>, String),
+    UpdatesInstalled {
+        report: Report,
+        cached: Option<UpdateReport>,
+        findings: Vec<Finding>,
+        outcomes: Vec<update_plan::UpdateOutcome>,
+    },
     Failed(String),
+}
+#[derive(Default)]
+struct CachedInstallState {
+    report: Option<UpdateReport>,
+    selected: Vec<String>,
+    plan: Option<UpdatePlan>,
+    consent: bool,
+}
+impl CachedInstallState {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 struct Workbench {
     instance: Instance,
@@ -117,6 +138,7 @@ struct Workbench {
     review: bool,
     consent: bool,
     reviewed: Option<RepairPlan>,
+    cached_installs: CachedInstallState,
     settings: bool,
     log_open: bool,
     log_follow: bool,
@@ -151,6 +173,7 @@ impl Workbench {
             review: false,
             consent: false,
             reviewed: None,
+            cached_installs: Default::default(),
             settings: false,
             log_open: true,
             log_follow: true,
@@ -174,7 +197,7 @@ impl Workbench {
         }
     }
     fn scan(&mut self, ctx: &egui::Context) {
-        if self.busy {
+        if self.busy || self.review || self.cached_installs.plan.is_some() {
             return;
         }
         let Some(work) = self.begin_work() else {
@@ -209,7 +232,11 @@ impl Workbench {
         });
     }
     fn apply(&mut self, ctx: &egui::Context) {
-        if self.busy || !self.consent || self.reviewed.is_none() {
+        if self.busy
+            || !self.consent
+            || self.reviewed.is_none()
+            || self.cached_installs.plan.is_some()
+        {
             return;
         }
         let plan = self.reviewed.as_ref().unwrap().clone();
@@ -250,7 +277,11 @@ impl Workbench {
         });
     }
     fn prepare(&mut self, ctx: &egui::Context) {
-        if self.busy || !self.policy.network_allowed() {
+        if self.busy
+            || self.review
+            || self.cached_installs.plan.is_some()
+            || !self.policy.network_allowed()
+        {
             return;
         }
         let Some(work) = self.begin_work() else {
@@ -284,17 +315,22 @@ impl Workbench {
             self.busy = false;
             match message {
                 Message::Failed(error) => {
+                    self.cached_installs.clear();
                     self.report = None;
                     self.selected.clear();
                     self.message = error;
                     self.message_error = true;
                 }
                 Message::Scanned(report) => {
+                    self.cached_installs.clear();
+                    // A configuration rescan replaces the snapshot. Do not carry
+                    // cached-update results forward as if they were re-queried.
                     self.report = Some(report);
                     self.message = "Checks complete".into();
                     self.message_error = false;
                 }
                 Message::Prepared(report, result) => {
+                    self.cached_installs.clear();
                     self.report = Some(report);
                     self.message_error = result.is_err();
                     self.message = match result {
@@ -302,7 +338,22 @@ impl Workbench {
                         Err(error) => format!("Offline preparation failed: {error}"),
                     };
                 }
+                Message::CachedUpdates(cached, findings, summary) => {
+                    self.cached_installs.clear();
+                    self.cached_installs.report = cached;
+                    if let Some(report) = &mut self.report {
+                        merge_cached_updates(report, findings);
+                        self.message = format!(
+                            "{summary} Metadata age and complete vulnerability coverage remain unknown."
+                        );
+                        self.message_error = false;
+                    } else {
+                        self.message = "Update metadata query finished, but no configuration report is available. Scan again before continuing.".into();
+                        self.message_error = true;
+                    }
+                }
                 Message::Repaired(report, results) => {
+                    self.cached_installs.clear();
                     let failures = results.iter().filter(|(_, r)| r.is_err()).count();
                     let restart = results
                         .iter()
@@ -323,6 +374,27 @@ impl Workbench {
                     };
                     self.selected.clear();
                 }
+                Message::UpdatesInstalled {
+                    mut report,
+                    cached,
+                    findings,
+                    outcomes,
+                } => {
+                    self.cached_installs.clear();
+                    self.cached_installs.report = cached;
+                    merge_cached_updates(&mut report, findings);
+                    self.report = Some(report);
+                    let unverified = outcomes.iter().filter(|result| !result.verified).count();
+                    self.message_error = unverified != 0;
+                    self.message = if unverified == 0 {
+                        "Selected update results verified by Windows. Inspect restart information in the work log; no automatic restart was requested.".into()
+                    } else {
+                        format!(
+                            "{unverified} update result(s) are not verified. Changes may have occurred and a restart may be required; inspect the work log before retrying."
+                        )
+                    };
+                    self.selected.clear();
+                }
             }
             if let Some(report) = &self.report {
                 self.selected.retain(|action| {
@@ -333,6 +405,118 @@ impl Workbench {
                 });
             }
         }
+    }
+    fn cached_updates(&mut self, ctx: &egui::Context, refresh: bool) {
+        if self.busy
+            || self.review
+            || self.cached_installs.plan.is_some()
+            || self.report.is_none()
+            || (refresh && !self.policy.network_allowed())
+        {
+            return;
+        }
+        let Some(work) = self.begin_work() else {
+            return;
+        };
+        self.busy = true;
+        self.message = if refresh { "Refreshing metadata from the configured Windows update service; no update payload download requested…" } else { "Checking locally cached Windows Update metadata…" }.into();
+        self.message_error = false;
+        let mut audit = self.audit.clone();
+        let policy = self.policy.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _work = work;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (cached, findings, summary) = if refresh {
+                    engine::refresh_update_report(&policy, &mut audit)
+                } else {
+                    engine::scan_cached_update_report(&mut audit)
+                };
+                Message::CachedUpdates(cached, findings, summary)
+            }));
+            let message = result.unwrap_or_else(|_| {
+                audit.log("ERROR", "Windows Update metadata worker stopped unexpectedly; update results are unavailable");
+                Message::Failed("Update metadata inspection stopped unexpectedly. Scan again before continuing.".into())
+            });
+            let _ = tx.send(message);
+            ctx.request_repaint();
+        });
+    }
+    fn review_cached_installs(&mut self) {
+        if self.busy
+            || self.review
+            || self.cached_installs.plan.is_some()
+            || !self.policy.storage_allowed()
+        {
+            return;
+        }
+        let (Some(cached), Some(report)) = (&self.cached_installs.report, &self.report) else {
+            return;
+        };
+        match update_plan::build_plan(cached, &self.cached_installs.selected, &report.os) {
+            Ok(plan) => {
+                self.cached_installs.plan = Some(plan);
+                self.cached_installs.consent = false;
+            }
+            Err(error) => {
+                self.message = format!("Cannot review cached installs: {error:#}");
+                self.message_error = true;
+            }
+        }
+    }
+    fn install_cached_updates(&mut self, ctx: &egui::Context) {
+        if self.busy
+            || self.review
+            || !self.cached_installs.consent
+            || !self.policy.storage_allowed()
+        {
+            return;
+        }
+        let Some(plan) = self.cached_installs.plan.clone() else {
+            return;
+        };
+        let approval = match approve_cached_review(&plan, self.cached_installs.consent) {
+            Ok(approval) => approval,
+            Err(error) => {
+                self.message = format!("Cached install approval failed: {error:#}");
+                self.message_error = true;
+                return;
+            }
+        };
+        let Some(work) = self.begin_work() else {
+            return;
+        };
+        self.busy = true;
+        self.cached_installs.plan = None;
+        self.cached_installs.consent = false;
+        self.cached_installs.selected.clear();
+        self.message = "Installing the exact selected cached updates…".into();
+        self.message_error = false;
+        let mut audit = self.audit.clone();
+        let policy = self.policy.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _work = work;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let outcomes = update_plan::execute_plan(&plan, &approval, &policy, &mut audit);
+                let report = engine::scan_with_policy(&policy, &mut audit);
+                let (cached, findings, _) = engine::scan_cached_update_report(&mut audit);
+                Message::UpdatesInstalled {
+                    report,
+                    cached,
+                    findings,
+                    outcomes,
+                }
+            }));
+            let message = result.unwrap_or_else(|_| {
+                audit.log("ERROR", "Cached update installer worker stopped unexpectedly; changes, install status and restart requirements are unverified");
+                Message::Failed("Update installation stopped unexpectedly. Changes may have occurred and restart requirements are unknown. Inspect Windows update state before retrying.".into())
+            });
+            let _ = tx.send(message);
+            ctx.request_repaint();
+        });
     }
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let (bar, _) =
@@ -619,14 +803,30 @@ impl Workbench {
         ui.horizontal_wrapped(|ui| {
             ui.heading(self.section.label());
             if ui
-                .add_enabled(!self.busy && !self.review, egui::Button::new("Scan again"))
+                .add_enabled(!self.busy && !self.review && self.cached_installs.plan.is_none(), egui::Button::new("Scan again"))
                 .clicked()
             {
                 self.scan(ui.ctx());
             }
+            if ui.add_enabled(!self.busy && !self.review && self.cached_installs.plan.is_none() && self.report.is_some(), egui::Button::new("Check cached updates"))
+                .on_hover_text("Reads local Windows Update metadata only. Its freshness is unknown; it does not query online or install updates.")
+                .clicked() {
+                self.cached_updates(ui.ctx(), false);
+            }
+            if ui.add_enabled(!self.busy && !self.review && self.cached_installs.plan.is_none() && self.report.is_some() && self.policy.network_allowed(), egui::Button::new("Refresh update data"))
+                .on_hover_text("Queries the configured Windows update service; sends applicability information and updates Windows cache. Downloads no update payloads.")
+                .clicked() {
+                self.cached_updates(ui.ctx(), true);
+            }
+            if !self.cached_installs.selected.is_empty() {
+                if ui.add_enabled(!self.busy && !self.review && self.cached_installs.plan.is_none() && self.policy.storage_allowed(), egui::Button::new(format!("Review cached installs ({})", self.cached_installs.selected.len())))
+                    .on_hover_text("Update installation needs Windows cached payloads; unavailable in --noexternal. Embedded configuration repairs still work.").clicked() {
+                    self.review_cached_installs();
+                }
+            }
             if ui
                 .add_enabled(
-                    !self.busy && !self.review && !self.selected.is_empty(),
+                    !self.busy && !self.review && self.cached_installs.plan.is_none() && !self.selected.is_empty(),
                     egui::Button::new(format!("Fix selected ({})", self.selected.len())),
                 )
                 .clicked()
@@ -648,7 +848,7 @@ impl Workbench {
             }
             if ui
                 .add_enabled(
-                    !self.busy && !self.review && self.policy.network_allowed(),
+                    !self.busy && !self.review && self.cached_installs.plan.is_none() && self.policy.network_allowed(),
                     egui::Button::new("Prepare offline data"),
                 )
                 .clicked()
@@ -667,7 +867,10 @@ impl Workbench {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    !self.busy && !self.review && self.report.is_some(),
+                    !self.busy
+                        && !self.review
+                        && self.cached_installs.plan.is_none()
+                        && self.report.is_some(),
                     egui::Button::new("Select eligible repairs"),
                 )
                 .clicked()
@@ -678,7 +881,10 @@ impl Workbench {
             }
             if ui
                 .add_enabled(
-                    !self.busy && !self.review && !self.selected.is_empty(),
+                    !self.busy
+                        && !self.review
+                        && self.cached_installs.plan.is_none()
+                        && !self.selected.is_empty(),
                     egui::Button::new("Clear selection"),
                 )
                 .clicked()
@@ -723,7 +929,7 @@ impl Workbench {
                 &mut self.expanded,
                 &mut self.selected,
                 self.advanced,
-                self.busy || self.review,
+                self.busy || self.review || self.cached_installs.plan.is_some(),
                 self.low,
                 self.dark,
                 None,
@@ -753,6 +959,9 @@ impl Workbench {
                     ui.label(capability);
                 }
             });
+        }
+        if matches!(self.section, Section::All | Section::Windows) {
+            self.cached_install_list(ui);
         }
         ui.add_space(12.0);
         ui.separator();
@@ -831,6 +1040,87 @@ impl Workbench {
             self.apply(ctx);
         }
     }
+    fn cached_install_list(&mut self, ui: &mut egui::Ui) {
+        let Some(cached) = &self.cached_installs.report else {
+            return;
+        };
+        let target_supported = self.report.as_ref().is_some_and(|r| {
+            !r.os.is_server && !r.os.build.is_empty() && r.os.edition != "Unknown"
+        });
+        let snapshot_eligible = cached.complete
+            && !cached.requested_online
+            && cached.criteria == crate::updates::CRITERIA
+            && cached.server_selection == Some(0)
+            && cached.result_code == 2
+            && cached.issues.is_empty()
+            && target_supported;
+        let allow_selection = !self.busy
+            && !self.review
+            && self.cached_installs.plan.is_none()
+            && snapshot_eligible
+            && self.policy.storage_allowed();
+        ui.collapsing(format!("Cached installers ({})", cached.updates.len()), |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.weak("Critical changes. Cache age is unknown. Selection requires cached content, prior license acceptance and noninteractive metadata.");
+            if !snapshot_eligible { ui.label("This cached inspection or Windows target is status-only; install selection is unavailable."); }
+            if !self.policy.storage_allowed() { ui.label("Update installation needs Windows cached payloads and is unavailable in --noexternal. Embedded configuration repairs still work."); }
+            for update in &cached.updates {
+                let key = update.exact_key();
+                let eligible = update_plan::eligible(update);
+                let mut selected = self.cached_installs.selected.contains(&key);
+                if ui.add_enabled(allow_selection && eligible, egui::Checkbox::new(&mut selected, update.title.as_deref().unwrap_or("Update title unavailable"))).changed() {
+                    if selected { self.cached_installs.selected.push(key.clone()); }
+                    else { self.cached_installs.selected.retain(|value| value != &key); }
+                }
+                bounded_record(ui, &key);
+                ui.weak(format!("Downloaded: {} · License accepted: {} · {}", bool_state(update.downloaded), bool_state(update.eula_accepted), if eligible { "Metadata eligible for review" } else { "Not eligible for installation" }));
+                ui.separator();
+            }
+        });
+    }
+    fn cached_install_review(&mut self, ctx: &egui::Context) {
+        let Some(plan) = self.cached_installs.plan.as_ref() else {
+            return;
+        };
+        let mut install = false;
+        let mut cancel = false;
+        egui::Window::new("Review cached update installs").collapsible(false).resizable(true)
+            .default_width(440.0_f32.min((ctx.content_rect().width() - 36.0).max(200.0)))
+            .max_width((ctx.content_rect().width() - 36.0).max(200.0))
+            .max_height((ctx.content_rect().height() - 76.0).max(120.0))
+            .constrain_to(ctx.content_rect().shrink(12.0)).vscroll(true).show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                bounded_record(ui, &format!("Plan {}", plan.id()));
+                if ui.small_button("Copy update plan").clicked() { ui.ctx().copy_text(cached_plan_text(plan)); }
+                ui.strong("Critical changes · Cache age unknown");
+                egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 230.0).clamp(56.0, 240.0)).show(ui, |ui| {
+                    for update in plan.updates() {
+                        ui.strong(update.title.as_deref().unwrap_or("Update title unavailable"));
+                        bounded_record(ui, &format!("Exact identity: {}", update.exact_key()));
+                        bounded_record(ui, &format!("KB articles: {}", update.kb_article_ids.as_ref().map(|ids| ids.join(", ")).unwrap_or_else(|| "Unknown".into())));
+                        ui.label("Install only this cached identity and revision; Windows may include publisher-defined bundled components.");
+                        ui.separator();
+                    }
+                    ui.strong("Impact"); bounded_record(ui, plan.impact());
+                    ui.strong("Recovery"); bounded_record(ui, plan.recovery());
+                    ui.label("No download, automatic license acceptance or automatic restart is authorized.");
+                });
+                ui.separator();
+                ui.checkbox(&mut self.cached_installs.consent, "I approve this exact critical update plan, including possible service interruption and restart requirements.");
+                ui.horizontal_wrapped(|ui| {
+                    install = ui.add_enabled(self.cached_installs.consent && !self.busy && self.policy.storage_allowed(), egui::Button::new("Install selected and recheck"))
+                        .on_hover_text("Update installation needs Windows cached payloads; unavailable in --noexternal. Embedded configuration repairs still work.").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            self.cached_installs.plan = None;
+            self.cached_installs.consent = false;
+        }
+        if install {
+            self.install_cached_updates(ctx);
+        }
+    }
     fn catalog(&mut self, ui: &mut egui::Ui) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.add_space(8.0);
@@ -860,7 +1150,7 @@ impl Workbench {
                 &mut self.expanded,
                 &mut self.selected,
                 self.advanced,
-                self.busy || self.review,
+                self.busy || self.review || self.cached_installs.plan.is_some(),
                 self.low,
                 self.dark,
                 Some(repair.impact()),
@@ -993,6 +1283,7 @@ impl eframe::App for Workbench {
                 .show(ui, |ui| self.content(ui));
         });
         self.review_window(&ctx);
+        self.cached_install_review(&ctx);
         self.settings_window(&ctx);
         if self.busy {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1036,6 +1327,9 @@ fn resize_edges(ui: &mut egui::Ui) {
 }
 
 fn category(f: &Finding) -> Section {
+    if is_cached_update_id(&f.id) {
+        return Section::Windows;
+    }
     let text = format!("{} {}", f.id, f.name).to_ascii_lowercase();
     if text.contains("firewall")
         || text.contains("network")
@@ -1062,6 +1356,33 @@ fn category(f: &Finding) -> Section {
     }
 }
 
+fn is_cached_update_id(id: &str) -> bool {
+    id.starts_with("windows-update-") || id.starts_with("windows-update:")
+}
+
+/// Replace this explicitly requested query's namespace, not configuration checks.
+/// Cached update findings are informational and can never authorize a repair.
+fn merge_cached_updates(report: &mut Report, findings: Vec<Finding>) {
+    report
+        .findings
+        .retain(|finding| !is_cached_update_id(&finding.id));
+    for mut finding in findings
+        .into_iter()
+        .filter(|finding| is_cached_update_id(&finding.id))
+    {
+        finding.repair = None;
+        if let Some(previous) = report
+            .findings
+            .iter_mut()
+            .find(|previous| previous.id == finding.id)
+        {
+            *previous = finding;
+        } else {
+            report.findings.push(finding);
+        }
+    }
+}
+
 fn eligible_repairs(report: &Report) -> Vec<Repair> {
     let mut repairs = Vec::new();
     for finding in &report.findings {
@@ -1081,6 +1402,36 @@ fn approve_review(plan: &RepairPlan, consent: bool) -> anyhow::Result<engine::Pl
         anyhow::bail!("Approve the displayed plan before applying changes");
     }
     engine::approve_plan(plan, plan.has_critical())
+}
+
+fn approve_cached_review(
+    plan: &UpdatePlan,
+    consent: bool,
+) -> anyhow::Result<update_plan::UpdateApproval> {
+    if !consent {
+        anyhow::bail!("Explicit approval of this critical update plan is required");
+    }
+    update_plan::approve_plan(plan, true)
+}
+
+fn bool_state(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "Yes",
+        Some(false) => "No",
+        None => "Unknown",
+    }
+}
+
+fn cached_plan_text(plan: &UpdatePlan) -> String {
+    let mut text = format!(
+        "Critical cached Windows Update plan {}\nCache age and complete vulnerability coverage are unknown.\n",
+        plan.id()
+    );
+    for update in plan.updates() {
+        text.push_str(&format!("\nTitle: {}\nIdentity: {}\nRevision: {}\nExact key: {}\nKB articles: {}\nDownloaded: {}\nLicense previously accepted: {}\nInstallation behavior: {:?}\n", update.title.as_deref().unwrap_or("Unknown"), update.update_id, update.revision, update.exact_key(), update.kb_article_ids.as_ref().map(|ids| ids.join(", ")).unwrap_or_else(|| "Unknown".into()), bool_state(update.downloaded), bool_state(update.eula_accepted), update.installation_behavior));
+    }
+    text.push_str(&format!("\nImpact: {}\nRecovery: {}\nNo download, automatic license acceptance or automatic restart is authorized.\n", plan.impact(), plan.recovery()));
+    text
 }
 
 fn plan_text(plan: &RepairPlan) -> String {
@@ -1483,6 +1834,123 @@ fn highlight(job: &mut egui::text::LayoutJob, text: &str, dark: bool) {
 mod finding_row_tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn cached_fixture() -> (UpdateReport, crate::model::OsProfile) {
+        let update = crate::updates::UpdateInfo {
+            update_id: "00000000-0000-0000-0000-000000000001".into(),
+            revision: 1,
+            title: Some("Fixture cached update".into()),
+            kb_article_ids: Some(vec!["000001".into()]),
+            msrc_severity: Some("Important".into()),
+            categories: Some(vec![]),
+            downloaded: Some(true),
+            eula_accepted: Some(true),
+            reboot_pending: Some(false),
+            installation_behavior: Some(crate::updates::InstallationBehavior {
+                can_request_user_input: false,
+                impact: 0,
+                reboot_behavior: 2,
+            }),
+            issues: vec![],
+        };
+        (
+            UpdateReport {
+                complete: true,
+                criteria: crate::updates::CRITERIA.into(),
+                scope: crate::updates::SCOPE.into(),
+                requested_online: false,
+                server_selection: Some(0),
+                result_code: 2,
+                reported_count: 1,
+                updates: vec![update],
+                issues: vec![],
+            },
+            crate::model::OsProfile {
+                edition: "Professional".into(),
+                build: "fixture-build".into(),
+                has_desktop: true,
+                ..Default::default()
+            },
+        )
+    }
+    #[test]
+    fn cached_install_review_requires_exact_critical_consent() {
+        let (report, os) = cached_fixture();
+        let key = report.updates[0].exact_key();
+        let plan = update_plan::build_plan(&report, &[key.clone()], &os).unwrap();
+        assert!(approve_cached_review(&plan, false).is_err());
+        assert!(approve_cached_review(&plan, true).is_ok());
+        let copied = cached_plan_text(&plan);
+        assert!(copied.contains(&key));
+        assert!(copied.contains("000001"));
+        assert!(copied.contains("Critical"));
+    }
+    #[test]
+    fn refreshed_scan_discards_cached_report_selection_and_consent() {
+        let (report, os) = cached_fixture();
+        let selected = vec![report.updates[0].exact_key()];
+        let plan = update_plan::build_plan(&report, &selected, &os).unwrap();
+        let mut state = CachedInstallState {
+            report: Some(report),
+            selected,
+            plan: Some(plan),
+            consent: true,
+        };
+        state.clear();
+        assert!(state.report.is_none());
+        assert!(state.selected.is_empty());
+        assert!(state.plan.is_none());
+        assert!(!state.consent);
+    }
+
+    #[test]
+    fn cached_update_merge_replaces_only_update_namespace_and_deduplicates() {
+        let config = finding();
+        let mut old = finding();
+        old.id = "windows-update-old".into();
+        let mut report = Report {
+            os: Default::default(),
+            apps: vec![],
+            findings: vec![config.clone(), old],
+        };
+        let mut summary = finding();
+        summary.id = "windows-update-cache".into();
+        summary.name = "Cached updates".into();
+        let mut update = finding();
+        update.id = "windows-update:one".into();
+        update.name = "Network driver update".into();
+        let mut repeated = update.clone();
+        repeated.evidence = "Latest query evidence".into();
+        let mut foreign = config.clone();
+        foreign.evidence = "Must not replace configuration evidence".into();
+        merge_cached_updates(&mut report, vec![summary, update, repeated, foreign]);
+        assert_eq!(report.findings.len(), 3);
+        assert!(!report.findings.iter().any(|f| f.id == "windows-update-old"));
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .find(|f| f.id == config.id)
+                .unwrap()
+                .evidence,
+            config.evidence
+        );
+        let cached = report
+            .findings
+            .iter()
+            .filter(|f| is_cached_update_id(&f.id))
+            .collect::<Vec<_>>();
+        assert!(cached.iter().all(|f| f.repair.is_none()));
+        let item = cached
+            .iter()
+            .find(|f| f.id == "windows-update:one")
+            .unwrap();
+        assert_eq!(item.evidence, "Latest query evidence");
+        assert!(category(item) == Section::Windows);
+        merge_cached_updates(&mut report, vec![]);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].id, config.id);
+    }
 
     #[test]
     fn review_identifiers_and_sources_wrap_at_minimum_window_size() {
